@@ -26,6 +26,37 @@ using npu_preparation = at_npu::native::OpPreparation;
 using namespace op_plugin::utils;
 using namespace op_infer;
 
+namespace {
+bool ResolveChunkLocalCumsumOutputDtype(
+    const std::string &output_dtype_str,
+    c10::ScalarType input_dtype,
+    c10::ScalarType &resolved_dtype)
+{
+    if (output_dtype_str.empty() || output_dtype_str == "float" || output_dtype_str == "float32" ||
+        output_dtype_str == "fp32" || output_dtype_str == "torch.float" ||
+        output_dtype_str == "torch.float32") {
+        resolved_dtype = c10::ScalarType::Float;
+        return true;
+    }
+    if (output_dtype_str == "same" || output_dtype_str == "same_as_input" || output_dtype_str == "input" ||
+        output_dtype_str == "none" || output_dtype_str == "None" || output_dtype_str == "null") {
+        resolved_dtype = input_dtype;
+        return true;
+    }
+    if (output_dtype_str == "float16" || output_dtype_str == "fp16" || output_dtype_str == "half" ||
+        output_dtype_str == "torch.float16" || output_dtype_str == "torch.half") {
+        resolved_dtype = c10::ScalarType::Half;
+        return true;
+    }
+    if (output_dtype_str == "bfloat16" || output_dtype_str == "bf16" ||
+        output_dtype_str == "torch.bfloat16") {
+        resolved_dtype = c10::ScalarType::BFloat16;
+        return true;
+    }
+    return false;
+}
+} // namespace
+
 
 ::std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor> npu_prepare_wy_repr_bwd_full(const at::Tensor & k, const at::Tensor & v, const at::Tensor & beta, const at::Tensor & A, const at::Tensor & dA, const at::Tensor & dw, const at::Tensor & du, const at::Tensor & g, int64_t chunk_size, at::OptionalIntArrayRef cu_seqlens, at::OptionalIntArrayRef chunk_indices)
 {
@@ -594,19 +625,13 @@ at::Tensor npu_chunk_local_cumsum(
     TORCH_CHECK(head_first, "npu_chunk_local_cumsum: only head_first=true / [B, H, T] layout is supported.");
 
     std::string output_dtype_str(output_dtype.data(), output_dtype.size());
-    if (output_dtype_str.empty()) {
-        output_dtype_str = "same";
-    }
-    const bool output_dtype_same = output_dtype_str == "same" || output_dtype_str == "same_as_input" ||
-                                   output_dtype_str == "input";
-    const bool output_dtype_float32 = output_dtype_str == "float32" || output_dtype_str == "torch.float" ||
-                                      output_dtype_str == "torch.float32";
-    TORCH_CHECK(output_dtype_same || (output_dtype_float32 && g.scalar_type() == at::kFloat),
-                "npu_chunk_local_cumsum: output dtype must preserve g dtype; got ", output_dtype_str,
-                " for g dtype ", g.scalar_type());
+    c10::ScalarType out_scalar_type = c10::ScalarType::Float;
+    TORCH_CHECK(ResolveChunkLocalCumsumOutputDtype(output_dtype_str, g.scalar_type(), out_scalar_type),
+                "npu_chunk_local_cumsum: output_dtype must be float32/float16/bfloat16 or same/input/none, got ",
+                output_dtype_str);
 
     at::Tensor g_contig = g.contiguous();
-    at::Tensor out = at::empty_like(g_contig);
+    at::Tensor out = at::empty(g_contig.sizes(), g_contig.options().dtype(out_scalar_type));
 
     const bool has_cu_seqlens = cu_seqlens.has_value() && cu_seqlens->size() > 0;
     const bool has_chunk_indices = chunk_indices_out.has_value() && chunk_indices_out->size() > 0;

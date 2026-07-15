@@ -18,6 +18,8 @@ DTYPE_LABELS = {
     torch.bfloat16: "bf16",
 }
 
+OUTPUT_DTYPE_SPECS = (None, "float32", "float16", "bfloat16", "same")
+
 
 def _next_power_of_two(value: int) -> int:
     value = max(value, 1)
@@ -45,6 +47,7 @@ def reference_impl(
     reverse: bool,
     scale: float,
     cu_seqlens: Optional[torch.Tensor] = None,
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     out = torch.empty_like(g, dtype=torch.float32)
     for batch in range(g.size(0)):
@@ -65,7 +68,19 @@ def reference_impl(
                     else:
                         value = torch.cumsum(segment, dim=0)
                     out[batch, head, start:end] = value * scale
-    return out.to(g.dtype)
+    return out.to(output_dtype)
+
+
+def resolve_output_dtype(input_dtype: torch.dtype, output_dtype: Optional[str]) -> torch.dtype:
+    if output_dtype is None or output_dtype in {"", "float", "float32", "fp32", "torch.float", "torch.float32"}:
+        return torch.float32
+    if output_dtype in {"same", "same_as_input", "input", "none", "None", "null"}:
+        return input_dtype
+    if output_dtype in {"float16", "fp16", "half", "torch.float16", "torch.half"}:
+        return torch.float16
+    if output_dtype in {"bfloat16", "bf16", "torch.bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"unsupported output_dtype={output_dtype}")
 
 
 def _tolerances(dtype: torch.dtype) -> Tuple[float, float]:
@@ -84,6 +99,7 @@ def run_case(
     scale: float = 1.0,
     cu_seqlens_values: Optional[List[int]] = None,
     dtype: torch.dtype = torch.float32,
+    output_dtype: Optional[str] = "same",
 ) -> None:
     torch.manual_seed(sum(ord(ch) for ch in name))
     if len(shape) != 3:
@@ -101,31 +117,41 @@ def run_case(
         cu_seqlens_arg = cu_seqlens_cpu.tolist()
         chunk_indices_arg = chunk_indices_cpu.reshape(-1).tolist()
 
-    actual = torch.ops.npu.npu_chunk_local_cumsum(
-        g_npu,
-        chunk_size,
-        cu_seqlens=cu_seqlens_arg,
-        chunk_indices_out=chunk_indices_arg,
-        reverse=reverse,
-        scale=scale,
-        head_first=True,
-        output_dtype="same",
-    ).cpu()
-    expected = reference_impl(g_cpu, chunk_size, reverse, scale, cu_seqlens_cpu)
+    kwargs = {
+        "cu_seqlens": cu_seqlens_arg,
+        "chunk_indices_out": chunk_indices_arg,
+        "reverse": reverse,
+        "scale": scale,
+        "head_first": True,
+    }
+    if output_dtype is not None:
+        kwargs["output_dtype"] = output_dtype
+    actual = torch.ops.npu.npu_chunk_local_cumsum(g_npu, chunk_size, **kwargs).cpu()
+    expected_dtype = resolve_output_dtype(dtype, output_dtype)
+    expected = reference_impl(g_cpu, chunk_size, reverse, scale, cu_seqlens_cpu, expected_dtype)
 
-    if actual.dtype != dtype:
-        raise AssertionError(f"{name}: expected output dtype {dtype}, got {actual.dtype}")
-    rtol, atol = _tolerances(dtype)
+    if actual.dtype != expected_dtype:
+        raise AssertionError(f"{name}: expected output dtype {expected_dtype}, got {actual.dtype}")
+    rtol, atol = _tolerances(expected_dtype)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     print(
-        f"[PASS] {name}: dtype={DTYPE_LABELS[dtype]}, shape={shape}, "
-        f"chunk_size={chunk_size}, reverse={reverse}, scale={scale}"
+        f"[PASS] {name}: input={DTYPE_LABELS[dtype]}, output={DTYPE_LABELS[expected_dtype]}, "
+        f"output_dtype={output_dtype}, shape={shape}, chunk_size={chunk_size}, reverse={reverse}, scale={scale}"
     )
 
 
 if __name__ == "__main__":
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
         suffix = DTYPE_LABELS[dtype]
+        for output_dtype in OUTPUT_DTYPE_SPECS:
+            output_suffix = "default" if output_dtype is None else output_dtype.replace(".", "_")
+            run_case(
+                f"fixed_bht_output_{suffix}_{output_suffix}",
+                (2, 3, 129),
+                chunk_size=64,
+                dtype=dtype,
+                output_dtype=output_dtype,
+            )
         run_case(f"fixed_bht_forward_{suffix}", (9, 2, 128), chunk_size=64, dtype=dtype)
         run_case(
             f"fixed_bht_reverse_scale_{suffix}",

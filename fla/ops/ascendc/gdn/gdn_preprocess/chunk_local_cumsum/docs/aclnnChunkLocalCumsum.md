@@ -62,15 +62,15 @@ aclnnStatus aclnnChunkLocalCumsum(
 
 | 参数名 | 输入/输出 | 描述 |
 |--------|-----------|------|
-| g | 输入 | Device 侧 aclTensor，数据类型仅支持 FLOAT32，shape 为 `[B, H, T]` |
+| g | 输入 | Device 侧 aclTensor，数据类型支持 FLOAT32、FLOAT16、BF16，shape 为 `[B, H, T]` |
 | cuSeqlensOptional | 输入 | 变长序列模式下的累积序列长度，可选参数。数据类型为 INT64 |
 | chunkIndicesOutOptional | 输入 | 变长序列模式下 block 到 `(seq_id, block_id)` 的映射，可选参数。数据类型为 INT64 |
 | chunkSize | 输入 | chunk 长度，必须为 2 的幂 |
 | reverse | 输入 | 是否执行反向 chunk 内累加 |
 | scale | 输入 | 输出缩放系数 |
 | headFirst | 输入 | 数据布局开关。当前仅支持 `true` |
-| outputDtypeOptional | 输入 | 输出 dtype 字符串。当前仅支持 `float32`、`torch.float`、`torch.float32` |
-| out | 输出 | Device 侧 aclTensor，数据类型仅支持 FLOAT32，shape 与 `g` 一致 |
+| outputDtypeOptional | 输入 | 输出 dtype 字符串。默认 `float32`；支持 `float32`/`torch.float32`、`float16`/`half`、`bfloat16`/`bf16`，以及 `same`/`input`/`none` 跟随输入 dtype |
+| out | 输出 | Device 侧 aclTensor，数据类型由 `outputDtypeOptional` 决定，shape 与 `g` 一致 |
 | workspaceSize | 输出 | 返回执行该算子所需的 workspace 大小 |
 | executor | 输出 | 返回算子执行器 |
 
@@ -85,18 +85,18 @@ aclnnStatus aclnnChunkLocalCumsum(
 
 ## 输入约束
 
-1. **数据类型**：输入 `g` 和输出 `out` 仅支持 FLOAT32。
+1. **数据类型**：输入 `g` 和输出 `out` 均支持 FLOAT32、FLOAT16、BF16；输入输出 dtype 可不一致，kernel 内部按 fp32 累加后 cast 到输出 dtype。
 2. **输入维度**：`g` 必须为 rank 3 的 tensor，shape 为 `[B, H, T]`，且各维为正数。
 3. **chunkSize**：必须为 2 的幂。
 4. **数据布局**：当前仅支持 `[B, H, T]`，`headFirst=false` 会返回失败。
-5. **输出 dtype**：`outputDtypeOptional` 仅支持 `float32`、`torch.float`、`torch.float32`。
+5. **输出 dtype**：`outputDtypeOptional` 默认 `float32`；支持 `float32`/`torch.float32`、`float16`/`half`、`bfloat16`/`bf16`，以及 `same`/`input`/`none` 跟随输入 dtype。
 6. **变长模式**：当 `cuSeqlensOptional` 非空时，`B` 必须为 1，`chunkIndicesOutOptional` 必须非空且元素个数为偶数。
 
 ## 输出说明
 
 | 输出 | 数据类型 | 描述 |
 |------|----------|------|
-| out | FLOAT32 | 输出与输入 `g` 同 shape，为 chunk-local cumsum 结果 |
+| out | FLOAT32 / FLOAT16 / BF16 | 输出与输入 `g` 同 shape，为 chunk-local cumsum 结果 |
 
 ## 返回值
 

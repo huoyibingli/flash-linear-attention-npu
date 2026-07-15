@@ -37,9 +37,9 @@ constexpr size_t ATTR_HEAD_FIRST_INDEX = 3;
 constexpr size_t ATTR_OUTPUT_DTYPE_INDEX = 4;
 constexpr uint32_t SYS_WORKSPACE_SIZE = 16U * 1024U * 1024U;
 constexpr int64_t H_TILE_SIZE = 512;
-constexpr int64_t INPUT_DTYPE_FP32 = 0;
-constexpr int64_t INPUT_DTYPE_FP16 = 1;
-constexpr int64_t INPUT_DTYPE_BF16 = 2;
+constexpr int64_t DTYPE_FP32 = 0;
+constexpr int64_t DTYPE_FP16 = 1;
+constexpr int64_t DTYPE_BF16 = 2;
 
 struct ChunkLocalCumsumCompileInfo {
     int64_t aivNum = 0;
@@ -63,6 +63,59 @@ static bool IsPowerOfTwo(int64_t value)
 static int64_t CeilDiv(int64_t a, int64_t b)
 {
     return (a + b - 1) / b;
+}
+
+static bool IsSupportedDataType(ge::DataType dtype)
+{
+    return dtype == ge::DT_FLOAT || dtype == ge::DT_FLOAT16 || dtype == ge::DT_BF16;
+}
+
+static int64_t ToTilingDataType(ge::DataType dtype)
+{
+    if (dtype == ge::DT_FLOAT16) {
+        return DTYPE_FP16;
+    }
+    if (dtype == ge::DT_BF16) {
+        return DTYPE_BF16;
+    }
+    return DTYPE_FP32;
+}
+
+static bool ResolveOutputDataType(const char *outputDtype, ge::DataType inputDtype, ge::DataType &resolvedDtype)
+{
+    if (outputDtype == nullptr || outputDtype[0] == '\0' ||
+        std::strcmp(outputDtype, "float") == 0 ||
+        std::strcmp(outputDtype, "float32") == 0 ||
+        std::strcmp(outputDtype, "fp32") == 0 ||
+        std::strcmp(outputDtype, "torch.float") == 0 ||
+        std::strcmp(outputDtype, "torch.float32") == 0) {
+        resolvedDtype = ge::DT_FLOAT;
+        return true;
+    }
+    if (std::strcmp(outputDtype, "same") == 0 ||
+        std::strcmp(outputDtype, "same_as_input") == 0 ||
+        std::strcmp(outputDtype, "input") == 0 ||
+        std::strcmp(outputDtype, "none") == 0 ||
+        std::strcmp(outputDtype, "None") == 0 ||
+        std::strcmp(outputDtype, "null") == 0) {
+        resolvedDtype = inputDtype;
+        return true;
+    }
+    if (std::strcmp(outputDtype, "float16") == 0 ||
+        std::strcmp(outputDtype, "fp16") == 0 ||
+        std::strcmp(outputDtype, "half") == 0 ||
+        std::strcmp(outputDtype, "torch.float16") == 0 ||
+        std::strcmp(outputDtype, "torch.half") == 0) {
+        resolvedDtype = ge::DT_FLOAT16;
+        return true;
+    }
+    if (std::strcmp(outputDtype, "bfloat16") == 0 ||
+        std::strcmp(outputDtype, "bf16") == 0 ||
+        std::strcmp(outputDtype, "torch.bfloat16") == 0) {
+        resolvedDtype = ge::DT_BF16;
+        return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -96,13 +149,13 @@ static ge::graphStatus TilingChunkLocalCumsum(gert::TilingContext *context)
 
     auto inDtype = context->GetInputDesc(G_INDEX)->GetDataType();
     auto outDtype = context->GetOutputDesc(OUT_INDEX)->GetDataType();
-    OP_CHECK_IF(inDtype != ge::DT_FLOAT && inDtype != ge::DT_FLOAT16 && inDtype != ge::DT_BF16,
+    OP_CHECK_IF(!IsSupportedDataType(inDtype),
                 OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(),
                                             "g dtype must be float32, float16, or bfloat16."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(outDtype != inDtype,
+    OP_CHECK_IF(!IsSupportedDataType(outDtype),
                 OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(),
-                                            "out dtype must be the same as g dtype."),
+                                            "out dtype must be float32, float16, or bfloat16."),
                 return ge::GRAPH_FAILED);
 
     auto chunkSizePtr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_CHUNK_SIZE_INDEX);
@@ -122,15 +175,17 @@ static ge::graphStatus TilingChunkLocalCumsum(gert::TilingContext *context)
                                             "only [B, H, T] layout."),
                 return ge::GRAPH_FAILED);
 
-    bool outputDtypeSame = std::strcmp(outputDtype, "same") == 0 ||
-                           std::strcmp(outputDtype, "same_as_input") == 0 ||
-                           std::strcmp(outputDtype, "input") == 0;
-    bool outputDtypeFloat32 = std::strcmp(outputDtype, "float32") == 0 ||
-                              std::strcmp(outputDtype, "torch.float") == 0 ||
-                              std::strcmp(outputDtype, "torch.float32") == 0;
-    OP_CHECK_IF(!outputDtypeSame && !(outputDtypeFloat32 && inDtype == ge::DT_FLOAT),
+    ge::DataType expectedOutDtype = ge::DT_FLOAT;
+    OP_CHECK_IF(!ResolveOutputDataType(outputDtype, inDtype, expectedOutDtype),
                 OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(),
-                                            "output_dtype must preserve g dtype; got %s.", outputDtype),
+                                            "output_dtype must be float32/float16/bfloat16 or same/input/none, got %s.",
+                                            outputDtype),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(outDtype != expectedOutDtype,
+                OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(),
+                                            "out dtype %d does not match output_dtype=%s expected dtype %d.",
+                                            static_cast<int>(outDtype), outputDtype,
+                                            static_cast<int>(expectedOutDtype)),
                 return ge::GRAPH_FAILED);
 
     int64_t chunkSize = *chunkSizePtr;
@@ -214,13 +269,8 @@ static ge::graphStatus TilingChunkLocalCumsum(gert::TilingContext *context)
     tiling->isVarlen = isVarlen ? 1 : 0;
     tiling->reverse = *reversePtr ? 1 : 0;
     tiling->headFirst = *headFirstPtr ? 1 : 0;
-    if (inDtype == ge::DT_FLOAT16) {
-        tiling->inputDtype = INPUT_DTYPE_FP16;
-    } else if (inDtype == ge::DT_BF16) {
-        tiling->inputDtype = INPUT_DTYPE_BF16;
-    } else {
-        tiling->inputDtype = INPUT_DTYPE_FP32;
-    }
+    tiling->inputDtype = ToTilingDataType(inDtype);
+    tiling->outputDtype = ToTilingDataType(outDtype);
     tiling->scale = *scalePtr;
 
     context->SetBlockDim(static_cast<uint32_t>(blockDim));

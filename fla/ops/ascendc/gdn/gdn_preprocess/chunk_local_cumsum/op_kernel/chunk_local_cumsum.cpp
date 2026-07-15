@@ -28,9 +28,9 @@ constexpr int64_t FAST_CHUNK_SCAN_BUFFER_NUM = 2;
 constexpr int64_t FP32_REPEAT_ELEMS = 64;
 constexpr int64_t VECTOR_MAX_REPEAT_TIMES = 255;
 constexpr int64_t VECTOR_MAX_CALC_ELEMS = FP32_REPEAT_ELEMS * VECTOR_MAX_REPEAT_TIMES;
-constexpr int64_t INPUT_DTYPE_FP32 = 0;
-constexpr int64_t INPUT_DTYPE_FP16 = 1;
-constexpr int64_t INPUT_DTYPE_BF16 = 2;
+constexpr int64_t DTYPE_FP32 = 0;
+constexpr int64_t DTYPE_FP16 = 1;
+constexpr int64_t DTYPE_BF16 = 2;
 constexpr int32_t BUFFER_NUM = 1;
 
 __aicore__ inline int64_t MinInt64(int64_t a, int64_t b)
@@ -53,7 +53,7 @@ __aicore__ inline int64_t AlignDownInt64(int64_t value, int64_t align)
     return (value / align) * align;
 }
 
-template <typename GType>
+template <typename GType, typename OType>
 class ChunkLocalCumsumKernel {
 public:
     __aicore__ inline ChunkLocalCumsumKernel() = default;
@@ -63,7 +63,7 @@ public:
     {
         tiling_ = tiling;
         gGm_.SetGlobalBuffer(reinterpret_cast<__gm__ GType *>(g), tiling_->totalElements);
-        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ GType *>(out), tiling_->totalElements);
+        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OType *>(out), tiling_->totalElements);
         if (tiling_->isVarlen != 0) {
             cuSeqlensGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
             chunkIndicesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(chunkIndices), tiling_->numBlocks * 2);
@@ -74,7 +74,7 @@ public:
         fastHTileSize_ = AlignDownInt64(MinInt64(MinInt64(H_TILE_SIZE, tiling_->h), maxFastHLen),
                                         FLOAT_ALIGN_ELEMS);
         // The log-step scan needs two chunk buffers; shrink only the fast H tile, not the whole fast path.
-        chunkFastPath_ = std::is_same<GType, float>::value &&
+        chunkFastPath_ = std::is_same<GType, float>::value && std::is_same<OType, float>::value &&
                          ((tiling_->h & (FLOAT_ALIGN_ELEMS - 1)) == 0) &&
                          (fastHTileSize_ >= FLOAT_ALIGN_ELEMS);
         if (chunkFastPath_) {
@@ -91,7 +91,11 @@ public:
                 int64_t inputRowBufferBytes =
                     AlignUpInt64(H_TILE_SIZE * static_cast<int64_t>(sizeof(GType)), UB_ALIGN_BYTES);
                 pipe_.InitBuffer(inputRowQueue_, BUFFER_NUM, inputRowBufferBytes);
-                pipe_.InitBuffer(outCastQueue_, BUFFER_NUM, inputRowBufferBytes);
+            }
+            if constexpr (!std::is_same<OType, float>::value) {
+                int64_t outputRowBufferBytes =
+                    AlignUpInt64(H_TILE_SIZE * static_cast<int64_t>(sizeof(OType)), UB_ALIGN_BYTES);
+                pipe_.InitBuffer(outCastQueue_, BUFFER_NUM, outputRowBufferBytes);
             }
         }
     }
@@ -150,7 +154,7 @@ private:
 
     __aicore__ inline void CopyUbToGm(int64_t gmOffset, LocalTensor<float> srcLocal, int64_t elementCount)
     {
-        if constexpr (std::is_same<GType, float>::value) {
+        if constexpr (std::is_same<OType, float>::value) {
             if ((elementCount & 7) == 0) {
                 DataCopy(outGm_[gmOffset], srcLocal, static_cast<uint32_t>(elementCount));
             } else {
@@ -159,12 +163,12 @@ private:
                 DataCopyPad(outGm_[gmOffset], srcLocal, copyParams);
             }
         } else {
-            LocalTensor<GType> outLocal = outCastQueue_.AllocTensor<GType>();
+            LocalTensor<OType> outLocal = outCastQueue_.AllocTensor<OType>();
             Cast(outLocal, srcLocal, RoundMode::CAST_RINT, static_cast<uint32_t>(elementCount));
             PipeBarrier<PIPE_V>();
             outCastQueue_.EnQue(outLocal);
-            outLocal = outCastQueue_.DeQue<GType>();
-            DataCopyExtParams copyParams{1, static_cast<uint32_t>(elementCount * static_cast<int64_t>(sizeof(GType))),
+            outLocal = outCastQueue_.DeQue<OType>();
+            DataCopyExtParams copyParams{1, static_cast<uint32_t>(elementCount * static_cast<int64_t>(sizeof(OType))),
                                          0, 0, 0};
             DataCopyPad(outGm_[gmOffset], outLocal, copyParams);
             outCastQueue_.FreeTensor(outLocal);
@@ -364,7 +368,7 @@ private:
             int64_t chunkStart = chunkIdx * tiling_->chunkSize;
             int64_t chunkEnd = MinInt64(chunkStart + tiling_->chunkSize, tiling_->t);
             int64_t baseOffset = bIdx * tiling_->t * tiling_->h;
-            if constexpr (std::is_same<GType, float>::value) {
+            if constexpr (std::is_same<GType, float>::value && std::is_same<OType, float>::value) {
                 if (chunkFastPath_) {
                     ProcessSequenceChunkFast(baseOffset, chunkStart, chunkEnd, hStart, hLen);
                 } else {
@@ -400,7 +404,7 @@ private:
             int64_t baseOffset = outerIdx * tiling_->t * tiling_->h + bos * tiling_->h;
             for (int64_t chunkStart = tStart; chunkStart < tEnd; chunkStart += tiling_->chunkSize) {
                 int64_t chunkEnd = MinInt64(chunkStart + tiling_->chunkSize, tEnd);
-                if constexpr (std::is_same<GType, float>::value) {
+                if constexpr (std::is_same<GType, float>::value && std::is_same<OType, float>::value) {
                     if (chunkFastPath_) {
                         ProcessSequenceChunkFast(baseOffset, chunkStart, chunkEnd, hStart, hLen);
                     } else {
@@ -423,7 +427,7 @@ private:
     TBuf<> scanBuf_;
     TBuf<> accBuf_;
     GlobalTensor<GType> gGm_;
-    GlobalTensor<GType> outGm_;
+    GlobalTensor<OType> outGm_;
     GlobalTensor<int64_t> cuSeqlensGm_;
     GlobalTensor<int64_t> chunkIndicesGm_;
     const ChunkLocalCumsumTilingData *tiling_ = nullptr;
@@ -438,16 +442,40 @@ extern "C" __global__ __aicore__ void chunk_local_cumsum(GM_ADDR g, GM_ADDR cuSe
     REGISTER_TILING_DEFAULT(ChunkLocalCumsumTilingData);
     GET_TILING_DATA_WITH_STRUCT(ChunkLocalCumsumTilingData, tilingData, tiling);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if (tilingData.inputDtype == INPUT_DTYPE_FP16) {
-        ChunkLocalCumsumKernel<half> op;
+    if (tilingData.inputDtype == DTYPE_FP16 && tilingData.outputDtype == DTYPE_FP16) {
+        ChunkLocalCumsumKernel<half, half> op;
         op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
         op.Process();
-    } else if (tilingData.inputDtype == INPUT_DTYPE_BF16) {
-        ChunkLocalCumsumKernel<bfloat16_t> op;
+    } else if (tilingData.inputDtype == DTYPE_FP16 && tilingData.outputDtype == DTYPE_BF16) {
+        ChunkLocalCumsumKernel<half, bfloat16_t> op;
+        op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
+        op.Process();
+    } else if (tilingData.inputDtype == DTYPE_FP16) {
+        ChunkLocalCumsumKernel<half, float> op;
+        op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
+        op.Process();
+    } else if (tilingData.inputDtype == DTYPE_BF16 && tilingData.outputDtype == DTYPE_FP16) {
+        ChunkLocalCumsumKernel<bfloat16_t, half> op;
+        op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
+        op.Process();
+    } else if (tilingData.inputDtype == DTYPE_BF16 && tilingData.outputDtype == DTYPE_BF16) {
+        ChunkLocalCumsumKernel<bfloat16_t, bfloat16_t> op;
+        op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
+        op.Process();
+    } else if (tilingData.inputDtype == DTYPE_BF16) {
+        ChunkLocalCumsumKernel<bfloat16_t, float> op;
+        op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
+        op.Process();
+    } else if (tilingData.outputDtype == DTYPE_FP16) {
+        ChunkLocalCumsumKernel<float, half> op;
+        op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
+        op.Process();
+    } else if (tilingData.outputDtype == DTYPE_BF16) {
+        ChunkLocalCumsumKernel<float, bfloat16_t> op;
         op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
         op.Process();
     } else {
-        ChunkLocalCumsumKernel<float> op;
+        ChunkLocalCumsumKernel<float, float> op;
         op.Init(g, cuSeqlens, chunkIndices, out, &tilingData);
         op.Process();
     }
