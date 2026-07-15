@@ -59,20 +59,20 @@ aclnnStatus aclnnChunkLocalCumsum(
 
 | 参数 | 数据类型 | 是否必须 | 描述 |
 |------|----------|----------|------|
-| g | FLOAT32 | 是 | 输入张量，shape 为 `[B, H, T]` |
+| g | FLOAT32 / FLOAT16 / BF16 | 是 | 输入张量，shape 为 `[B, H, T]` |
 | cu_seqlens | INT64 | 否 | 变长序列累积长度。固定长度模式传空 tensor |
 | chunk_indices_out | INT64 | 否 | 变长模式下 block 到 `(seq_id, block_id)` 的映射，按二元组连续存储 |
 | chunk_size | int64 | 是 | chunk 长度，必须为 2 的幂 |
 | reverse | bool | 否 | 是否执行反向 chunk 内累加，默认 `false` |
 | scale | double | 否 | 输出缩放系数，默认 `1.0` |
 | head_first | bool | 否 | 当前实现仅支持 `true` |
-| output_dtype | string | 否 | 当前仅支持 `float32`、`torch.float`、`torch.float32` |
+| output_dtype | string | 否 | 默认 `float32`；支持 `float32`/`torch.float32`、`float16`/`half`、`bfloat16`/`bf16`，以及 `same`/`input`/`none` 跟随输入 dtype |
 
 ---
 
 ## 4. 输入约束
 
-1. **数据类型**：输入 `g` 和输出 `out` 仅支持 FLOAT32。
+1. **数据类型**：输入 `g` 和输出 `out` 均支持 FLOAT32、FLOAT16、BF16；输入输出 dtype 可不一致，kernel 内部按 fp32 累加后 cast 到输出 dtype。
 2. **输入维度**：`g` 必须为 rank 3 的 tensor，shape 为 `[B, H, T]`。
 3. **chunk_size**：必须为 2 的幂，且 host tiling 计算得到的 `block_t` 不小于 `chunk_size`。
 4. **数据布局**：当前 AscendC kernel 仅支持 `[B, H, T]`，`head_first=false` 会被显式拒绝。

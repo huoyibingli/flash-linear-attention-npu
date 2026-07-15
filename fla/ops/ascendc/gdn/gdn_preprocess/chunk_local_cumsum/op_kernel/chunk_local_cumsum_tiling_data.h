@@ -30,6 +30,7 @@ struct ChunkLocalCumsumTilingData {
     int64_t reverse;
     int64_t headFirst;
     int64_t inputDtype;
+    int64_t outputDtype;
     float scale;
 };
 
