@@ -40,6 +40,7 @@ from fla_npu.ops.triton import (
     autocast_custom_bwd,
     autocast_custom_fwd,
     chunk_local_cumsum as triton_chunk_local_cumsum,
+    chunk_scaled_dot_kkt_fwd as triton_chunk_scaled_dot_kkt_fwd,
     input_guard,
     l2norm_bwd,
     l2norm_fwd,
@@ -52,6 +53,7 @@ _DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
 _ACCURACY_REFERENCE_VERSION = 1
 _SOLVE_TRI_ASCENDC_AVAILABLE: Optional[bool] = None
 _SOLVE_TRI_ASCENDC_UNAVAILABLE_REASON = ""
+_CUMSUM_KKT_ASCENDC_UNAVAILABLE_REASON = ""
 
 
 def _make_gate(shape: tuple[int, ...], dtype: torch.dtype, device: str, gate_function: str) -> torch.Tensor:
@@ -635,6 +637,112 @@ def chunk_scaled_dot_kkt_fwd_ascendc(
     return A
 
 
+def _should_use_ascendc_cumsum_kkt(
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    chunk_size: int,
+    output_dtype: torch.dtype,
+) -> bool:
+    if chunk_size not in (16, 32, 64, 128):
+        return False
+    if k.dim() != 4 or g.dim() != 3 or beta.dim() != 3:
+        return False
+    if k.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if output_dtype not in (torch.float, torch.float32):
+        return False
+    if g.shape != beta.shape:
+        return False
+    B, Hk, T, _ = k.shape
+    if g.shape[0] != B or g.shape[1] != T:
+        return False
+    Hv = g.shape[2]
+    return Hk > 0 and Hv > 0 and Hv % Hk == 0
+
+
+def chunk_local_cumsum_kkt_auto(
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    cu_seqlens: Optional[torch.Tensor],
+    chunk_indices: Optional[Dict[str, Optional[torch.LongTensor]]],
+    chunk_size: int,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    global _CUMSUM_KKT_ASCENDC_UNAVAILABLE_REASON
+
+    fallback_reason = ""
+    if _should_use_ascendc_cumsum_kkt(
+        k,
+        g,
+        beta,
+        chunk_size=chunk_size,
+        output_dtype=output_dtype,
+    ):
+        try:
+            g_ascendc = g.transpose(1, 2).contiguous()
+            beta_ascendc = beta.transpose(1, 2).contiguous().float()
+            g_ascendc = chunk_local_cumsum_ascendc(
+                g_ascendc,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                chunk_indices_out=chunk_indices,
+                head_first=True,
+            )
+            A_ascendc = chunk_scaled_dot_kkt_fwd_ascendc(
+                k=k,
+                g=g_ascendc,
+                beta=beta_ascendc,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
+                chunk_size=chunk_size,
+                output_dtype=output_dtype,
+            )
+            return g_ascendc, beta_ascendc, A_ascendc.transpose(1, 2).contiguous()
+        except Exception as exc:
+            _CUMSUM_KKT_ASCENDC_UNAVAILABLE_REASON = str(exc).splitlines()[0]
+            fallback_reason = _CUMSUM_KKT_ASCENDC_UNAVAILABLE_REASON
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+
+    if fallback_reason:
+        warnings.warn(
+            "AscendC chunk_local_cumsum/chunk_scaled_dot_kkt is unavailable; "
+            "falling back to Triton. "
+            f"Reason: {fallback_reason}",
+            RuntimeWarning,
+        )
+
+    g_triton = triton_chunk_local_cumsum(
+        g,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices_out=chunk_indices,
+        head_first=False,
+    )
+
+    # A is the WY lower-triangular representation before inversion.
+    A_triton = triton_chunk_scaled_dot_kkt_fwd(
+        k=k,
+        g=g_triton,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
+        chunk_size=chunk_size,
+        output_dtype=output_dtype,
+    )
+    return (
+        g_triton.transpose(1, 2).contiguous(),
+        beta.transpose(1, 2).contiguous().float(),
+        A_triton,
+    )
+
+
 def flash_chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -650,29 +758,16 @@ def flash_chunk_gated_delta_rule_fwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
-    g = g.transpose(1, 2).contiguous()
-    beta = beta.transpose(1, 2).contiguous().float()
-
-    g = chunk_local_cumsum_ascendc(
-        g,
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens,
-        chunk_indices_out=chunk_indices,
-        head_first=True,
-    )
-
-    # A is the WY lower-triangular representation before inversion.
-    A = chunk_scaled_dot_kkt_fwd_ascendc(
+    g, beta, A = chunk_local_cumsum_kkt_auto(
         k=k,
         g=g,
         beta=beta,
         cu_seqlens=cu_seqlens,
-        chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
+        chunk_indices=chunk_indices,
         chunk_size=chunk_size,
         output_dtype=torch.float32,
     )
 
-    A = A.transpose(1, 2).contiguous()
     A = solve_tri_auto(
         A,
         cu_seqlens=cu_seqlens,
