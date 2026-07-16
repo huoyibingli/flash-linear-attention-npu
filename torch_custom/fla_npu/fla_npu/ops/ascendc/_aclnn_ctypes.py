@@ -104,6 +104,30 @@ _GET_WORKSPACE_ARGTYPES = {
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_void_p),
     ],
+    "aclnnChunkLocalCumsum": [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_bool,
+        ctypes.c_double,
+        ctypes.c_bool,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_void_p),
+    ],
+    "aclnnChunkScaledDotKkt": [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_void_p),
+    ],
 }
 
 
@@ -485,6 +509,95 @@ def npu_recompute_w_u_fwd(
             ctx.tensor(u_out, "u"),
         ],
         outputs,
+    )
+
+
+def _chunk_local_cumsum_output_dtype(g, output_dtype):
+    import torch
+
+    if output_dtype is None:
+        return "float32", torch.float32
+    if isinstance(output_dtype, torch.dtype):
+        if output_dtype in (torch.float, torch.float32):
+            return "float32", torch.float32
+        if output_dtype in (torch.float16, torch.half):
+            return "float16", torch.float16
+        if output_dtype == torch.bfloat16:
+            return "bfloat16", torch.bfloat16
+        raise TypeError(f"Unsupported chunk_local_cumsum output_dtype: {output_dtype}.")
+
+    normalized = str(output_dtype).removeprefix("torch.").lower()
+    if normalized in {"float", "float32"}:
+        return "float32", torch.float32
+    if normalized in {"half", "float16"}:
+        return "float16", torch.float16
+    if normalized in {"bf16", "bfloat16"}:
+        return "bfloat16", torch.bfloat16
+    if normalized in {"same", "input", "none"}:
+        return normalized, g.dtype
+    raise TypeError(f"Unsupported chunk_local_cumsum output_dtype: {output_dtype}.")
+
+
+def npu_chunk_local_cumsum(
+    g,
+    chunk_size,
+    *,
+    cu_seqlens=None,
+    chunk_indices_out=None,
+    reverse=False,
+    scale=1.0,
+    head_first=True,
+    output_dtype="float32",
+):
+    output_dtype_name, out_dtype = _chunk_local_cumsum_output_dtype(g, output_dtype)
+    g_contig = g.contiguous()
+    out = _empty(_shape(g_contig), g_contig, dtype=out_dtype)
+    output_dtype_buffer = ctypes.create_string_buffer(output_dtype_name.encode("utf-8"))
+    return _call_aclnn(
+        "aclnnChunkLocalCumsum",
+        lambda ctx: [
+            ctx.tensor(g_contig, "g"),
+            ctx.int_array(cu_seqlens),
+            ctx.int_array(chunk_indices_out),
+            ctypes.c_int64(int(chunk_size)),
+            ctypes.c_bool(bool(reverse)),
+            ctypes.c_double(float(scale)),
+            ctypes.c_bool(bool(head_first)),
+            ctypes.cast(output_dtype_buffer, ctypes.c_char_p),
+            ctx.tensor(out, "out"),
+        ],
+        out,
+    )
+
+
+def npu_chunk_scaled_dot_kkt(
+    k,
+    g,
+    beta,
+    *,
+    cu_seqlens=None,
+    chunk_indices=None,
+    chunk_size=64,
+):
+    import torch
+
+    k_contig = k.contiguous()
+    g_contig = g.contiguous()
+    beta_contig = beta.contiguous()
+    B, Hk, T, _ = _shape(k_contig)
+    out = _empty((B, Hk, T, int(chunk_size)), k_contig, dtype=torch.float32)
+    return _call_aclnn(
+        "aclnnChunkScaledDotKkt",
+        lambda ctx: [
+            ctx.tensor(k_contig, "k"),
+            ctx.tensor(g_contig, "g"),
+            ctx.tensor(beta_contig, "beta"),
+            ctx.int_array(cu_seqlens),
+            ctx.int_array(chunk_indices),
+            ctypes.c_int64(int(chunk_size)),
+            ctx.tensor(out, "out"),
+        ],
+        out,
     )
 
 
