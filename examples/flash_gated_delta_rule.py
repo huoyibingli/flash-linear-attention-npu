@@ -465,9 +465,17 @@ def _as_chunk_list_dict(
     return {str(chunk_size): _as_int_list(value)}
 
 
+def _next_power_of_two(value: int) -> int:
+    value = max(int(value), 1)
+    return 1 << (value - 1).bit_length()
+
+
 def _cumsum_block_t(g: torch.Tensor, chunk_size: int) -> int:
-    # Keep this aligned with fla_npu.ops.triton.chunk_local_cumsum_scalar.
-    return int(chunk_size)
+    if g.dim() != 3:
+        raise ValueError(f"AscendC chunk_local_cumsum expects rank-3 input, got shape={tuple(g.shape)}.")
+    # Keep this aligned with chunk_local_cumsum_tiling.cpp. The AscendC tiling
+    # currently uses tail=1 for [B,H,T], so blockT depends on chunk_size only.
+    return _next_power_of_two((1 << 17) // int(chunk_size))
 
 
 def _ensure_varlen_metadata(
@@ -493,9 +501,10 @@ def _ensure_varlen_metadata(
     tensor_indices = _as_chunk_dict(chunk_indices, chunk_size)
     list_indices = _as_chunk_list_dict(chunk_indices_list, chunk_size)
 
+    cumsum_block_t = _cumsum_block_t(g, chunk_size)
     required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES)
     required_sizes.add(int(chunk_size))
-    required_sizes.add(_cumsum_block_t(g, chunk_size))
+    required_sizes.add(cumsum_block_t)
 
     for size in required_sizes:
         key = str(size)
@@ -580,8 +589,9 @@ def chunk_local_cumsum_ascendc(
     if not head_first:
         raise ValueError("AscendC chunk_local_cumsum expects B,H,T input; transpose before calling.")
 
+    cumsum_block_t = _cumsum_block_t(g, chunk_size)
     chunk_indices = (
-        _chunk_tensor(chunk_indices_out, chunk_size)
+        _chunk_tensor(chunk_indices_out, cumsum_block_t)
         if isinstance(chunk_indices_out, dict)
         else chunk_indices_out
     )
