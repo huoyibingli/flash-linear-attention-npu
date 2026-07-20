@@ -129,7 +129,7 @@ chunk_local_cumsum/
 ```bash
 cd /home/m00913889/codex08/flash-linear-attention-npu
 bash build.sh --pkg --soc=ascend910b --ops=chunk_local_cumsum -j16
-python3 fla/ops/ascendc/gdn/gdn_preprocess/chunk_local_cumsum/test/test.py
+python3 fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_local_cumsum/test/test.py
 bash torch_custom/fla_npu/test/test.sh --device 0 --op chunk_local_cumsum
 ```
 
