@@ -119,7 +119,7 @@ chunk_scaled_dot_kkt/
 算子目录测试入口：
 
 ```bash
-python3 fla/ops/ascendc/gdn/gdn_preprocess/chunk_scaled_dot_kkt/test/test.py
+python3 fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_scaled_dot_kkt/test/test.py
 ```
 
 torch 插件侧测试入口：

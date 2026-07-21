@@ -1,10 +1,12 @@
+"""Local test for the ChunkLocalCumsum custom NPU operator."""
+
 import math
 import os
 from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from fla_npu.ops.ascendc import chunk_local_cumsum
+import fla_npu
 
 
 torch.npu.config.allow_internal_format = False
@@ -34,7 +36,8 @@ def _block_t(shape: Tuple[int, ...], chunk_size: int) -> int:
 
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, block_t: int) -> torch.Tensor:
     rows = []
-    for seq_idx, (start, end) in enumerate(zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())):
+    pairs = zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+    for seq_idx, (start, end) in enumerate(pairs):
         num_blocks = math.ceil((end - start) / block_t)
         for block_idx in range(num_blocks):
             rows.append((seq_idx, block_idx))
@@ -91,6 +94,14 @@ def _tolerances(dtype: torch.dtype) -> Tuple[float, float]:
     return 2e-2, 5e-2
 
 
+def call_chunk_local_cumsum(g: torch.Tensor, chunk_size: int, **kwargs) -> torch.Tensor:
+    try:
+        op = torch.ops.npu.npu_chunk_local_cumsum
+    except AttributeError:
+        from fla_npu.ops.ascendc import npu_chunk_local_cumsum as op
+    return op(g, chunk_size, **kwargs)
+
+
 def run_case(
     name: str,
     shape: Tuple[int, ...],
@@ -105,11 +116,10 @@ def run_case(
     if len(shape) != 3:
         raise ValueError(f"{name}: chunk_local_cumsum only supports rank-3 [B, H, T], got shape={shape}")
     g_cpu = torch.randn(shape, dtype=torch.float32).to(dtype)
-    g_npu = g_cpu.npu()
 
+    cu_seqlens_cpu = None
     cu_seqlens_arg = None
     chunk_indices_arg = None
-    cu_seqlens_cpu = None
     if cu_seqlens_values is not None:
         cu_seqlens_cpu = torch.tensor(cu_seqlens_values, dtype=torch.long)
         block_t = _block_t(shape, chunk_size)
@@ -126,7 +136,7 @@ def run_case(
     }
     if output_dtype is not None:
         kwargs["output_dtype"] = output_dtype
-    actual = chunk_local_cumsum(g_npu, chunk_size, **kwargs).cpu()
+    actual = call_chunk_local_cumsum(g_cpu.npu(), chunk_size, **kwargs).cpu()
     expected_dtype = resolve_output_dtype(dtype, output_dtype)
     expected = reference_impl(g_cpu, chunk_size, reverse, scale, cu_seqlens_cpu, expected_dtype)
 
@@ -140,52 +150,45 @@ def run_case(
     )
 
 
-if __name__ == "__main__":
+def main() -> int:
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
         suffix = DTYPE_LABELS[dtype]
         for output_dtype in OUTPUT_DTYPE_SPECS:
             output_suffix = "default" if output_dtype is None else output_dtype.replace(".", "_")
             run_case(
-                f"fixed_bht_output_{suffix}_{output_suffix}",
+                f"fixed_output_{suffix}_{output_suffix}",
                 (2, 3, 129),
                 chunk_size=64,
                 dtype=dtype,
                 output_dtype=output_dtype,
             )
-        run_case(f"fixed_bht_forward_{suffix}", (9, 2, 128), chunk_size=64, dtype=dtype)
+        run_case(f"fixed_forward_{suffix}", (9, 2, 128), chunk_size=64, dtype=dtype)
         run_case(
-            f"fixed_bht_reverse_scale_{suffix}",
+            f"fixed_reverse_scale_{suffix}",
             (9, 2, 128),
             chunk_size=64,
             reverse=True,
             scale=0.25,
             dtype=dtype,
         )
-        run_case(f"fixed_bht_odd_t_forward_{suffix}", (2, 3, 129), chunk_size=64, dtype=dtype)
+        run_case(f"fixed_odd_t_forward_{suffix}", (2, 3, 129), chunk_size=64, dtype=dtype)
         if dtype is not torch.float32:
             run_case(
-                f"fixed_bht_long_low_precision_row_path_{suffix}",
+                f"fixed_long_low_precision_row_path_{suffix}",
                 (1, 1, 8192),
                 chunk_size=64,
                 dtype=dtype,
                 output_dtype="same",
             )
         run_case(
-            f"varlen_bht_forward_{suffix}",
-            (1, 2, 128),
-            chunk_size=64,
-            cu_seqlens_values=[0, 128],
-            dtype=dtype,
-        )
-        run_case(
-            f"varlen_bht_long_forward_{suffix}",
+            f"varlen_forward_{suffix}",
             (1, 8, 3580),
             chunk_size=64,
             cu_seqlens_values=[0, 3580],
             dtype=dtype,
         )
         run_case(
-            f"varlen_bht_reverse_scale_{suffix}",
+            f"varlen_reverse_scale_{suffix}",
             (1, 8, 3580),
             chunk_size=64,
             reverse=True,
@@ -193,3 +196,8 @@ if __name__ == "__main__":
             cu_seqlens_values=[0, 1024, 2048, 3580],
             dtype=dtype,
         )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

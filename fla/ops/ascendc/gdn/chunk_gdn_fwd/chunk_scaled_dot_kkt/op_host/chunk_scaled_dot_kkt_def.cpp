@@ -45,6 +45,12 @@ public:
             .NeedCheckSupportFlag(false)
             .ExtendCfgInfo("opFile.value", "chunk_scaled_dot_kkt");
         this->AICore().AddConfig("ascend910b", aicoreConfig);
+        this->AICore().AddConfig("ascend910_93", aicoreConfig);
+#ifdef ASCEND_SOC_VERSION
+        if (std::string(ASCEND_SOC_VERSION) == "ascend950") {
+            this->AICore().AddConfig("ascend950", aicoreConfig);
+        }
+#endif
     }
 };
 
