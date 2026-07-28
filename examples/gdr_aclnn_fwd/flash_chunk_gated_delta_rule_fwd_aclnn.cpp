@@ -1,3 +1,4 @@
+
 /*
  * Standalone ACLNN driver for flash_chunk_gated_delta_rule_fwd.
  *
@@ -8,6 +9,7 @@
  *   beta: [B,H,T], float32
  *   o:    [B,H,T,V], fp16/bf16 storage
  *   A:    [B,H,T,chunk_size], fp16/bf16 storage after solve_tri
+ *   h:    [B,H,total_chunks,K,V], fp16/bf16 chunk state from fwd_h
  *
  * solve_tri is the only step that uses a temporary layout: dense cases use
  * BSND [B,T,H,BT], and varlen cases use a TND view [T,H,BT], then convert back.
@@ -18,7 +20,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <iostream>
 #include <numeric>
 #include <sstream>
@@ -194,6 +195,20 @@ std::vector<int64_t> BuildChunkIndices(const std::vector<int64_t> &cuSeqlens, in
     return result;
 }
 
+int64_t NextPowerOfTwo(int64_t value)
+{
+    int64_t result = 1;
+    while (result < value) {
+        result <<= 1;
+    }
+    return result;
+}
+
+int64_t CumsumBlockT(int64_t chunkSize)
+{
+    return NextPowerOfTwo((int64_t{1} << 17) / chunkSize);
+}
+
 bool ParseBool(const std::string &value)
 {
     return value == "1" || value == "true" || value == "True" || value == "yes";
@@ -367,54 +382,6 @@ bool CopyDeviceToBytes(const DeviceTensor &tensor, std::vector<uint8_t> &bytes)
     return true;
 }
 
-template <typename GetWorkspaceFn, typename LaunchFn>
-bool RunOp(const char *name, GetWorkspaceFn getWorkspace, LaunchFn launch, aclrtStream stream)
-{
-    uint64_t workspaceSize = 0;
-    aclOpExecutor *executor = nullptr;
-    auto status = getWorkspace(&workspaceSize, &executor);
-    if (status != ACL_SUCCESS) {
-        std::cerr << name << "GetWorkspaceSize failed: " << status << "\n";
-        return false;
-    }
-
-    void *workspace = nullptr;
-    if (workspaceSize > 0) {
-        auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "workspace aclrtMalloc failed for " << name << ": " << ret << "\n";
-            return false;
-        }
-    }
-
-    status = launch(workspace, workspaceSize, executor, stream);
-    if (status != ACL_SUCCESS) {
-        std::cerr << name << " failed: " << status << "\n";
-        if (workspace != nullptr) {
-            aclrtFree(workspace);
-        }
-        return false;
-    }
-
-    auto ret = aclrtSynchronizeStream(stream);
-    if (ret != ACL_SUCCESS) {
-        std::cerr << "aclrtSynchronizeStream failed after " << name << ": " << ret << "\n";
-        if (workspace != nullptr) {
-            aclrtFree(workspace);
-        }
-        return false;
-    }
-
-    if (workspace != nullptr) {
-        ret = aclrtFree(workspace);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "workspace aclrtFree failed for " << name << ": " << ret << "\n";
-            return false;
-        }
-    }
-    return true;
-}
-
 class IntArrayHolder {
 public:
     explicit IntArrayHolder(const std::vector<int64_t> &values)
@@ -481,24 +448,38 @@ bool WriteTensorFile(const std::filesystem::path &path, const DeviceTensor &tens
     return WriteFileExact(path, bytes.data(), bytes.size());
 }
 
-int Run(const Params &params)
+struct PipelineShapes {
+    std::vector<int64_t> qShape;
+    std::vector<int64_t> vShape;
+    std::vector<int64_t> gateShape;
+    std::vector<int64_t> aShape;
+    std::vector<int64_t> aSolveStorageShape;
+    std::vector<int64_t> aSolveViewShape;
+    std::vector<int64_t> solvePerm;
+    std::vector<int64_t> hShape;
+    std::vector<int64_t> finalShape;
+};
+
+PipelineShapes MakePipelineShapes(const Params &params)
 {
-    const aclDataType inputDType = StorageDType(params.dtype);
     const bool varlen = !params.cuSeqlens.empty();
     const int64_t totalChunks = varlen ? static_cast<int64_t>(params.chunkIndices.size() / 2)
                                        : (params.tokens + params.chunkSize - 1) / params.chunkSize;
     const int64_t stateCount = varlen ? static_cast<int64_t>(params.cuSeqlens.size() - 1) : params.batch;
+    return {
+        {params.batch, params.heads, params.tokens, params.keyDim},
+        {params.batch, params.heads, params.tokens, params.valueDim},
+        {params.batch, params.heads, params.tokens},
+        {params.batch, params.heads, params.tokens, params.chunkSize},
+        {params.batch, params.tokens, params.heads, params.chunkSize},
+        {params.tokens, params.heads, params.chunkSize},
+        {0, 2, 1, 3},
+        {params.batch, params.heads, totalChunks, params.keyDim, params.valueDim},
+        {stateCount, params.heads, params.keyDim, params.valueDim},
+    };
+}
 
-    aclrtContext context = nullptr;
-    aclrtStream stream = nullptr;
-    auto ret = InitAcl(params.device, &context, &stream);
-    if (ret != ACL_SUCCESS) {
-        aclrtResetDevice(params.device);
-        aclFinalize();
-        return 1;
-    }
-
-    bool ok = true;
+struct PipelineTensors {
     DeviceTensor q;
     DeviceTensor k;
     DeviceTensor v;
@@ -519,204 +500,577 @@ int Run(const Params &params)
     DeviceTensor finalState;
     DeviceTensor o;
 
+    void Destroy()
+    {
+        o.Destroy();
+        finalState.Destroy();
+        vNew.Destroy();
+        h.Destroy();
+        u.Destroy();
+        w.Destroy();
+        aSolveBhtd.Destroy();
+        aSolveOutView.Destroy();
+        aSolveInView.Destroy();
+        aSolveOutStorage.Destroy();
+        aSolveInStorage.Destroy();
+        aKktCastBhtd.Destroy();
+        aKktFloat.Destroy();
+        gCum.Destroy();
+        beta.Destroy();
+        gIn.Destroy();
+        v.Destroy();
+        k.Destroy();
+        q.Destroy();
+    }
+};
+
+struct ChunkGatedDeltaRuleOutputs {
+    const DeviceTensor *g = nullptr;
+    const DeviceTensor *o = nullptr;
+    const DeviceTensor *a = nullptr;
+    const DeviceTensor *h = nullptr;
+    const DeviceTensor *finalState = nullptr;
+};
+
+bool PrepareChunkGatedDeltaRuleTensors(const Params &params, const PipelineShapes &shapes, aclDataType inputDType,
+                                       PipelineTensors &tensors)
+{
+    const bool varlen = !params.cuSeqlens.empty();
+    bool ok = true;
+    ok = ok && ReadTensor(params.inputDir / "q.bin", shapes.qShape, inputDType, tensors.q);
+    ok = ok && ReadTensor(params.inputDir / "k.bin", shapes.qShape, inputDType, tensors.k);
+    ok = ok && ReadTensor(params.inputDir / "v.bin", shapes.vShape, inputDType, tensors.v);
+    ok = ok && ReadTensor(params.inputDir / "g.bin", shapes.gateShape, ACL_FLOAT, tensors.gIn);
+    ok = ok && ReadTensor(params.inputDir / "beta.bin", shapes.gateShape, ACL_FLOAT, tensors.beta);
+    if (!ok) {
+        std::cerr << "failed to read input tensors\n";
+        return false;
+    }
+
+    ok = ok && tensors.gCum.Create(nullptr, shapes.gateShape, ACL_FLOAT);
+    ok = ok && tensors.aKktFloat.Create(nullptr, shapes.aShape, ACL_FLOAT);
+    ok = ok && tensors.aKktCastBhtd.Create(nullptr, shapes.aShape, inputDType);
+    ok = ok && tensors.aSolveInStorage.Create(nullptr, shapes.aSolveStorageShape, inputDType);
+    ok = ok && tensors.aSolveOutStorage.Create(nullptr, shapes.aSolveStorageShape, inputDType);
+    ok = ok && tensors.aSolveBhtd.Create(nullptr, shapes.aShape, inputDType);
+    if (varlen) {
+        ok = ok && tensors.aSolveInView.CreateView(tensors.aSolveInStorage.addr, shapes.aSolveViewShape, inputDType);
+        ok = ok && tensors.aSolveOutView.CreateView(tensors.aSolveOutStorage.addr, shapes.aSolveViewShape, inputDType);
+    }
+    ok = ok && tensors.w.Create(nullptr, shapes.qShape, inputDType);
+    ok = ok && tensors.u.Create(nullptr, shapes.vShape, inputDType);
+    ok = ok && tensors.h.Create(nullptr, shapes.hShape, inputDType);
+    ok = ok && tensors.vNew.Create(nullptr, shapes.vShape, inputDType);
+    if (params.outputFinalState) {
+        ok = ok && tensors.finalState.Create(nullptr, shapes.finalShape, ACL_FLOAT);
+    } else {
+        ok = ok && tensors.finalState.Create(nullptr, {1}, inputDType);
+    }
+    ok = ok && tensors.o.Create(nullptr, shapes.vShape, inputDType);
+    if (!ok) {
+        std::cerr << "failed to prepare chunk gated delta rule tensors\n";
+    }
+    return ok;
+}
+
+
+bool ChunkGatedDeltaRule(const Params &params, const PipelineShapes &shapes, PipelineTensors &tensors,
+                         aclrtStream stream, ChunkGatedDeltaRuleOutputs &outputs)
+{
+    // Mirrors Python flash_chunk_gated_delta_rule_fwd:
+    // cumsum -> KKT -> solve_tri -> recompute_w_u -> fwd_h -> fwd_o.
+    // Cast/Permute calls below are local dtype/layout adapters around solve_tri.
+    // Prepare optional varlen metadata. Dense cases keep the ACL int arrays empty, so get() returns nullptr.
+    const bool varlen = !params.cuSeqlens.empty();
+    const std::vector<int64_t> cumsumChunkIndices =
+        varlen ? BuildChunkIndices(params.cuSeqlens, CumsumBlockT(params.chunkSize)) : std::vector<int64_t>{};
+    IntArrayHolder cuArray(params.cuSeqlens);
+    IntArrayHolder chunkArray(params.chunkIndices);
+    IntArrayHolder cumsumChunkArray(cumsumChunkIndices);
+    IntArrayHolder solvePermArray(shapes.solvePerm);
+    char outputDtype[] = "float32";
+
+    // 1. Accumulate gate values inside each chunk: g[B,H,T] -> gCum[B,H,T] in fp32.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnChunkLocalCumsumGetWorkspaceSize(
+            tensors.gIn.tensor, cuArray.get(), cumsumChunkArray.get(), params.chunkSize, false, 1.0, true,
+            outputDtype, tensors.gCum.tensor, &workspaceSize, &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkLocalCumsumGetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnChunkLocalCumsum: " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnChunkLocalCumsum(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkLocalCumsum failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkLocalCumsum: " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnChunkLocalCumsum: " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 2. Build the local KKT matrix using k, cumulative gates, and beta:
+    // aKktFloat[B,H,T,BT] is produced in fp32 for numerical stability.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnChunkScaledDotKktGetWorkspaceSize(
+            tensors.k.tensor, tensors.gCum.tensor, tensors.beta.tensor, cuArray.get(), chunkArray.get(),
+            params.chunkSize, tensors.aKktFloat.tensor, &workspaceSize, &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkScaledDotKktGetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnChunkScaledDotKkt: " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnChunkScaledDotKkt(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkScaledDotKkt failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkScaledDotKkt: " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnChunkScaledDotKkt: " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 3. Cast the KKT matrix back to the input storage dtype before solve_tri,
+    // matching the Python implementation's solve input dtype.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnCastGetWorkspaceSize(
+            tensors.aKktFloat.tensor, tensors.aKktCastBhtd.dtype, tensors.aKktCastBhtd.tensor, &workspaceSize,
+            &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnCast(A_kkt)GetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnCast(A_kkt): " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnCast(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnCast(A_kkt) failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnCast(A_kkt): " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnCast(A_kkt): " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 4. Convert A from BHTD storage to solve_tri's expected BSND/TND memory order.
+    // Dense uses [B,T,H,BT]; varlen uses a [T,H,BT] view over the same storage.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnPermuteGetWorkspaceSize(
+            tensors.aKktCastBhtd.tensor, solvePermArray.get(), tensors.aSolveInStorage.tensor, &workspaceSize,
+            &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnPermute(A_to_solve)GetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnPermute(A_to_solve): " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnPermute(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnPermute(A_to_solve) failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnPermute(A_to_solve): " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnPermute(A_to_solve): " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // Select the solve_tri tensor descriptor and layout string according to dense or varlen input.
+    const aclTensor *solveInTensor = varlen ? tensors.aSolveInView.tensor : tensors.aSolveInStorage.tensor;
+    const aclTensor *solveOutTensor = varlen ? tensors.aSolveOutView.tensor : tensors.aSolveOutStorage.tensor;
+    const char *solveLayout = varlen ? "tnd" : "bsnd";
+    // 5. Solve the per-chunk triangular system to obtain A after delta-rule normalization.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnSolveTriGetWorkspaceSize(
+            solveInTensor, cuArray.get(), chunkArray.get(), solveLayout, solveOutTensor, &workspaceSize, &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnSolveTriGetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnSolveTri: " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnSolveTri(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnSolveTri failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnSolveTri: " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnSolveTri: " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 6. Convert solved A back to the external BHTD layout for downstream ops and output dumping.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnPermuteGetWorkspaceSize(
+            tensors.aSolveOutStorage.tensor, solvePermArray.get(), tensors.aSolveBhtd.tensor, &workspaceSize,
+            &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnPermute(A_to_bhtd)GetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnPermute(A_to_bhtd): " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnPermute(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnPermute(A_to_bhtd) failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnPermute(A_to_bhtd): " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnPermute(A_to_bhtd): " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 7. Recompute W and U from k, v, beta, solved A, and cumulative gates.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnRecomputeWUFwdGetWorkspaceSize(
+            tensors.k.tensor, tensors.v.tensor, tensors.beta.tensor, tensors.aSolveBhtd.tensor, tensors.gCum.tensor,
+            nullptr, cuArray.get(), chunkArray.get(), params.chunkSize, tensors.w.tensor, tensors.u.tensor,
+            &workspaceSize, &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnRecomputeWUFwdGetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnRecomputeWUFwd: " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnRecomputeWUFwd(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnRecomputeWUFwd failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnRecomputeWUFwd: " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnRecomputeWUFwd: " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 8. Run the chunk recurrent state update and produce h plus the adjusted value tensor vNew.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
+            tensors.k.tensor, tensors.w.tensor, tensors.u.tensor, tensors.gCum.tensor, nullptr, nullptr,
+            params.outputFinalState, params.chunkSize, true, cuArray.get(), chunkArray.get(), false, false,
+            tensors.h.tensor, tensors.vNew.tensor, tensors.finalState.tensor, &workspaceSize, &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnChunkGatedDeltaRuleFwdH: " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnChunkGatedDeltaRuleFwdH(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkGatedDeltaRuleFwdH failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkGatedDeltaRuleFwdH: " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnChunkGatedDeltaRuleFwdH: " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    // 9. Compute the final attention output o from q, k, vNew, h, and cumulative gates.
+    {
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor = nullptr;
+        auto status = aclnnChunkFwdOGetWorkspaceSize(
+            tensors.q.tensor, tensors.k.tensor, tensors.vNew.tensor, tensors.h.tensor, tensors.gCum.tensor,
+            cuArray.get(), chunkArray.get(), params.scale, params.chunkSize, tensors.o.tensor, &workspaceSize,
+            &executor);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkFwdOGetWorkspaceSize failed: " << status << "\n";
+            return false;
+        }
+
+        void *workspace = nullptr;
+        if (workspaceSize > 0) {
+            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtMalloc failed for aclnnChunkFwdO: " << ret << "\n";
+                return false;
+            }
+        }
+
+        status = aclnnChunkFwdO(workspace, workspaceSize, executor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "aclnnChunkFwdO failed: " << status << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+
+        auto ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkFwdO: " << ret << "\n";
+            if (workspace != nullptr) {
+                aclrtFree(workspace);
+            }
+            return false;
+        }
+        if (workspace != nullptr) {
+            ret = aclrtFree(workspace);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "workspace aclrtFree failed for aclnnChunkFwdO: " << ret << "\n";
+                return false;
+            }
+        }
+    }
+
+    outputs.g = &tensors.gCum;
+    outputs.o = &tensors.o;
+    outputs.a = &tensors.aSolveBhtd;
+    outputs.h = &tensors.h;
+    outputs.finalState = params.outputFinalState ? &tensors.finalState : nullptr;
+    return true;
+}
+
+bool WriteChunkGatedDeltaRuleOutputs(const Params &params, const ChunkGatedDeltaRuleOutputs &outputs)
+{
+    std::filesystem::create_directories(params.outputDir);
+    bool ok = true;
+    ok = ok && WriteTensorFile(params.outputDir / "g.bin", *outputs.g);
+    ok = ok && WriteTensorFile(params.outputDir / "o.bin", *outputs.o);
+    ok = ok && WriteTensorFile(params.outputDir / "A.bin", *outputs.a);
+    ok = ok && WriteTensorFile(params.outputDir / "h.bin", *outputs.h);
+    if (params.outputFinalState && outputs.finalState != nullptr) {
+        ok = ok && WriteTensorFile(params.outputDir / "final_state.bin", *outputs.finalState);
+    }
+    return ok;
+}
+
+int RunPipeline(const Params &params)
+{
+    const aclDataType inputDType = StorageDType(params.dtype);
+    aclrtContext context = nullptr;
+    aclrtStream stream = nullptr;
+    auto ret = InitAcl(params.device, &context, &stream);
+    if (ret != ACL_SUCCESS) {
+        aclrtResetDevice(params.device);
+        aclFinalize();
+        return 1;
+    }
+
+    bool ok = true;
+    PipelineTensors tensors;
+    ChunkGatedDeltaRuleOutputs outputs;
+
     try {
-        const std::vector<int64_t> qShape = {params.batch, params.heads, params.tokens, params.keyDim};
-        const std::vector<int64_t> vShape = {params.batch, params.heads, params.tokens, params.valueDim};
-        const std::vector<int64_t> gateShape = {params.batch, params.heads, params.tokens};
-        const std::vector<int64_t> aShape = {params.batch, params.heads, params.tokens, params.chunkSize};
-        const std::vector<int64_t> aSolveStorageShape = {params.batch, params.tokens, params.heads, params.chunkSize};
-        const std::vector<int64_t> aSolveViewShape = {params.tokens, params.heads, params.chunkSize};
-        const std::vector<int64_t> solvePerm = {0, 2, 1, 3};
-        const std::vector<int64_t> hShape = {params.batch, params.heads, totalChunks, params.keyDim, params.valueDim};
-        const std::vector<int64_t> finalShape = {stateCount, params.heads, params.keyDim, params.valueDim};
-
-        ok = ok && ReadTensor(params.inputDir / "q.bin", qShape, inputDType, q);
-        ok = ok && ReadTensor(params.inputDir / "k.bin", qShape, inputDType, k);
-        ok = ok && ReadTensor(params.inputDir / "v.bin", vShape, inputDType, v);
-        ok = ok && ReadTensor(params.inputDir / "g.bin", gateShape, ACL_FLOAT, gIn);
-        ok = ok && ReadTensor(params.inputDir / "beta.bin", gateShape, ACL_FLOAT, beta);
-        if (!ok) {
-            throw std::runtime_error("failed to read input tensors");
-        }
-
-        ok = ok && gCum.Create(nullptr, gateShape, ACL_FLOAT);
-        ok = ok && aKktFloat.Create(nullptr, aShape, ACL_FLOAT);
-        if (!ok) {
-            throw std::runtime_error("failed to allocate cumsum/KKT outputs");
-        }
-
-        IntArrayHolder cuArray(params.cuSeqlens);
-        IntArrayHolder chunkArray(params.chunkIndices);
-        char outputDtype[] = "float32";
-
-        ok = ok && RunOp(
-            "aclnnChunkLocalCumsum",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnChunkLocalCumsumGetWorkspaceSize(
-                    gIn.tensor, cuArray.get(), chunkArray.get(), params.chunkSize, false, 1.0, true, outputDtype,
-                    gCum.tensor, workspaceSize, executor);
-            },
-            aclnnChunkLocalCumsum, stream);
-
-        ok = ok && RunOp(
-            "aclnnChunkScaledDotKkt",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnChunkScaledDotKktGetWorkspaceSize(
-                    k.tensor, gCum.tensor, beta.tensor, cuArray.get(), chunkArray.get(), params.chunkSize,
-                    aKktFloat.tensor, workspaceSize, executor);
-            },
-            aclnnChunkScaledDotKkt, stream);
-        if (!ok) {
-            throw std::runtime_error("cumsum/KKT op failed");
-        }
-
-        std::filesystem::create_directories(params.outputDir);
-        ok = ok && aKktCastBhtd.Create(nullptr, aShape, inputDType);
-        ok = ok && aSolveInStorage.Create(nullptr, aSolveStorageShape, inputDType);
-        ok = ok && aSolveOutStorage.Create(nullptr, aSolveStorageShape, inputDType);
-        ok = ok && aSolveBhtd.Create(nullptr, aShape, inputDType);
-        if (varlen) {
-            ok = ok && aSolveInView.CreateView(aSolveInStorage.addr, aSolveViewShape, inputDType);
-            ok = ok && aSolveOutView.CreateView(aSolveOutStorage.addr, aSolveViewShape, inputDType);
-        }
-        if (!ok) {
-            throw std::runtime_error("failed to prepare solve_tri tensors");
-        }
-
-        ok = ok && RunOp(
-            "aclnnCast(A_kkt)",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnCastGetWorkspaceSize(
-                    aKktFloat.tensor, inputDType, aKktCastBhtd.tensor, workspaceSize, executor);
-            },
-            aclnnCast, stream);
-        if (!ok) {
-            throw std::runtime_error("A KKT cast op failed");
-        }
-
-        IntArrayHolder solvePermArray(solvePerm);
-        ok = ok && RunOp(
-            "aclnnPermute(A_to_solve)",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnPermuteGetWorkspaceSize(
-                    aKktCastBhtd.tensor, solvePermArray.get(), aSolveInStorage.tensor, workspaceSize, executor);
-            },
-            aclnnPermute, stream);
-        if (!ok) {
-            throw std::runtime_error("A to solve layout transpose op failed");
-        }
-
-        aclTensor *solveInTensor = varlen ? aSolveInView.tensor : aSolveInStorage.tensor;
-        aclTensor *solveOutTensor = varlen ? aSolveOutView.tensor : aSolveOutStorage.tensor;
-        const char *solveLayout = varlen ? "tnd" : "bsnd";
-        ok = ok && RunOp(
-            "aclnnSolveTri",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnSolveTriGetWorkspaceSize(
-                    solveInTensor, cuArray.get(), chunkArray.get(), solveLayout, solveOutTensor, workspaceSize,
-                    executor);
-            },
-            aclnnSolveTri, stream);
-        if (!ok) {
-            throw std::runtime_error("solve_tri op failed");
-        }
-
-        ok = ok && RunOp(
-            "aclnnPermute(A_to_bhtd)",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnPermuteGetWorkspaceSize(
-                    aSolveOutStorage.tensor, solvePermArray.get(), aSolveBhtd.tensor, workspaceSize, executor);
-            },
-            aclnnPermute, stream);
-        if (!ok) {
-            throw std::runtime_error("failed to convert solve_tri output back to BHTD");
-        }
-
-        ok = ok && w.Create(nullptr, qShape, inputDType);
-        ok = ok && u.Create(nullptr, vShape, inputDType);
-        if (!ok) {
-            throw std::runtime_error("failed to prepare recompute tensors");
-        }
-
-        ok = ok && RunOp(
-            "aclnnRecomputeWUFwd",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnRecomputeWUFwdGetWorkspaceSize(
-                    k.tensor, v.tensor, beta.tensor, aSolveBhtd.tensor, gCum.tensor, nullptr, cuArray.get(),
-                    chunkArray.get(), params.chunkSize, w.tensor, u.tensor, workspaceSize, executor);
-            },
-            aclnnRecomputeWUFwd, stream);
-        if (!ok) {
-            throw std::runtime_error("recompute_w_u op failed");
-        }
-
-        ok = ok && h.Create(nullptr, hShape, inputDType);
-        ok = ok && vNew.Create(nullptr, vShape, inputDType);
-        if (params.outputFinalState) {
-            ok = ok && finalState.Create(nullptr, finalShape, ACL_FLOAT);
-        } else {
-            ok = ok && finalState.Create(nullptr, {1}, inputDType);
-        }
-        if (!ok) {
-            throw std::runtime_error("failed to prepare fwd_h tensors");
-        }
-
-        ok = ok && RunOp(
-            "aclnnChunkGatedDeltaRuleFwdH",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
-                    k.tensor, w.tensor, u.tensor, gCum.tensor, nullptr, nullptr, params.outputFinalState,
-                    params.chunkSize, true, cuArray.get(), chunkArray.get(), false, false, h.tensor, vNew.tensor,
-                    finalState.tensor, workspaceSize, executor);
-            },
-            aclnnChunkGatedDeltaRuleFwdH, stream);
-        if (!ok) {
-            throw std::runtime_error("fwd_h op failed");
-        }
-
-        ok = ok && o.Create(nullptr, vShape, inputDType);
-        ok = ok && RunOp(
-            "aclnnChunkFwdO",
-            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
-                return aclnnChunkFwdOGetWorkspaceSize(
-                    q.tensor, k.tensor, vNew.tensor, h.tensor, gCum.tensor, cuArray.get(), chunkArray.get(),
-                    params.scale, params.chunkSize, o.tensor, workspaceSize, executor);
-            },
-            aclnnChunkFwdO, stream);
-        if (!ok) {
-            throw std::runtime_error("fwd_o op failed");
-        }
-
-        ok = ok && WriteTensorFile(params.outputDir / "g.bin", gCum);
-        ok = ok && WriteTensorFile(params.outputDir / "o.bin", o);
-        ok = ok && WriteTensorFile(params.outputDir / "A.bin", aSolveBhtd);
-        if (params.outputFinalState) {
-            ok = ok && WriteTensorFile(params.outputDir / "final_state.bin", finalState);
-        }
+        const PipelineShapes shapes = MakePipelineShapes(params);
+        ok = ok && PrepareChunkGatedDeltaRuleTensors(params, shapes, inputDType, tensors);
+        ok = ok && ChunkGatedDeltaRule(params, shapes, tensors, stream, outputs);
+        ok = ok && WriteChunkGatedDeltaRuleOutputs(params, outputs);
     } catch (const std::exception &exc) {
         std::cerr << "driver failed: " << exc.what() << "\n";
         ok = false;
     }
 
-    o.Destroy();
-    finalState.Destroy();
-    vNew.Destroy();
-    h.Destroy();
-    u.Destroy();
-    w.Destroy();
-    aSolveBhtd.Destroy();
-    aSolveOutView.Destroy();
-    aSolveInView.Destroy();
-    aSolveOutStorage.Destroy();
-    aSolveInStorage.Destroy();
-    aKktCastBhtd.Destroy();
-    aKktFloat.Destroy();
-    gCum.Destroy();
-    beta.Destroy();
-    gIn.Destroy();
-    v.Destroy();
-    k.Destroy();
-    q.Destroy();
+    tensors.Destroy();
 
     if (stream != nullptr) {
         aclrtDestroyStream(stream);
@@ -732,6 +1086,11 @@ int Run(const Params &params)
     }
     std::cout << "flash_chunk_gated_delta_rule_fwd_aclnn ok\n";
     return 0;
+}
+
+int Run(const Params &params)
+{
+    return RunPipeline(params);
 }
 
 }  // namespace
