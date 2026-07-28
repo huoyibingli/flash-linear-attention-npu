@@ -7,8 +7,7 @@
  *   g:    [B,H,T], float32
  *   beta: [B,H,T], float32
  *   o:    [B,H,T,V], fp16/bf16 storage
- *   A:    [B,H,T,chunk_size], fp16/bf16 storage after solve_tri
- *   h:    [B,H,total_chunks,K,V], fp16/bf16 chunk state from fwd_h
+ *   chunkState: [B,H,total_chunks,K,V], fp16/bf16 chunk state from fwd_h
  *
  * solve_tri is the only step that uses a temporary layout: dense cases use
  * BSND [B,T,H,BT], and varlen cases use a TND view [T,H,BT], then convert back.
@@ -71,6 +70,9 @@ size_t DTypeSize(aclDataType dtype)
     }
     if (dtype == ACL_FLOAT16 || dtype == ACL_BF16) {
         return sizeof(uint16_t);
+    }
+    if (dtype == ACL_INT32) {
+        return sizeof(int32_t);
     }
     throw std::runtime_error("unsupported dtype size");
 }
@@ -153,6 +155,15 @@ std::vector<int64_t> ParseIntList(const std::string &text)
         if (!item.empty()) {
             result.push_back(std::stoll(item));
         }
+    }
+    return result;
+}
+
+std::vector<int32_t> BuildActualSeqLengths(const std::vector<int64_t> &cuSeqlens)
+{
+    std::vector<int32_t> result;
+    for (size_t i = 0; i + 1 < cuSeqlens.size(); ++i) {
+        result.push_back(static_cast<int32_t>(cuSeqlens[i + 1] - cuSeqlens[i]));
     }
     return result;
 }
@@ -372,10 +383,9 @@ struct PipelineShapes {
     std::vector<int64_t> qShape;
     std::vector<int64_t> vShape;
     std::vector<int64_t> gateShape;
-    std::vector<int64_t> aShape;
-    std::vector<int64_t> aSolveStorageShape;
-    std::vector<int64_t> aSolveViewShape;
-    std::vector<int64_t> hShape;
+    std::vector<int64_t> actualSeqLengthsShape;
+    std::vector<int64_t> initialStateShape;
+    std::vector<int64_t> chunkStateShape;
     std::vector<int64_t> finalShape;
 };
 
@@ -389,9 +399,8 @@ PipelineShapes MakePipelineShapes(const Params &params)
         {params.batch, params.heads, params.tokens, params.keyDim},
         {params.batch, params.heads, params.tokens, params.valueDim},
         {params.batch, params.heads, params.tokens},
-        {params.batch, params.heads, params.tokens, params.chunkSize},
-        {params.batch, params.tokens, params.heads, params.chunkSize},
-        {params.tokens, params.heads, params.chunkSize},
+        {stateCount},
+        {stateCount, params.heads, params.keyDim, params.valueDim},
         {params.batch, params.heads, totalChunks, params.keyDim, params.valueDim},
         {stateCount, params.heads, params.keyDim, params.valueDim},
     };
@@ -403,18 +412,9 @@ struct PipelineTensors {
     DeviceTensor v;
     DeviceTensor gIn;
     DeviceTensor beta;
-    DeviceTensor gCum;
-    DeviceTensor aKktFloat;
-    DeviceTensor aKktCastBhtd;
-    DeviceTensor aSolveInStorage;
-    DeviceTensor aSolveOutStorage;
-    DeviceTensor aSolveInView;
-    DeviceTensor aSolveOutView;
-    DeviceTensor aSolveBhtd;
-    DeviceTensor w;
-    DeviceTensor u;
-    DeviceTensor h;
-    DeviceTensor vNew;
+    DeviceTensor initialState;
+    DeviceTensor actualSeqLengths;
+    DeviceTensor chunkState;
     DeviceTensor finalState;
     DeviceTensor o;
 
@@ -422,18 +422,9 @@ struct PipelineTensors {
     {
         o.Destroy();
         finalState.Destroy();
-        vNew.Destroy();
-        h.Destroy();
-        u.Destroy();
-        w.Destroy();
-        aSolveBhtd.Destroy();
-        aSolveOutView.Destroy();
-        aSolveInView.Destroy();
-        aSolveOutStorage.Destroy();
-        aSolveInStorage.Destroy();
-        aKktCastBhtd.Destroy();
-        aKktFloat.Destroy();
-        gCum.Destroy();
+        chunkState.Destroy();
+        actualSeqLengths.Destroy();
+        initialState.Destroy();
         beta.Destroy();
         gIn.Destroy();
         v.Destroy();
@@ -457,20 +448,12 @@ bool PrepareChunkGatedDeltaRuleTensors(const Params &params, const PipelineShape
         return false;
     }
 
-    ok = ok && tensors.gCum.Create(nullptr, shapes.gateShape, ACL_FLOAT);
-    ok = ok && tensors.aKktFloat.Create(nullptr, shapes.aShape, ACL_FLOAT);
-    ok = ok && tensors.aKktCastBhtd.Create(nullptr, shapes.aShape, inputDType);
-    ok = ok && tensors.aSolveInStorage.Create(nullptr, shapes.aSolveStorageShape, inputDType);
-    ok = ok && tensors.aSolveOutStorage.Create(nullptr, shapes.aSolveStorageShape, inputDType);
-    ok = ok && tensors.aSolveBhtd.Create(nullptr, shapes.aShape, inputDType);
     if (varlen) {
-        ok = ok && tensors.aSolveInView.CreateView(tensors.aSolveInStorage.addr, shapes.aSolveViewShape, inputDType);
-        ok = ok && tensors.aSolveOutView.CreateView(tensors.aSolveOutStorage.addr, shapes.aSolveViewShape, inputDType);
+        const std::vector<int32_t> lengths = BuildActualSeqLengths(params.cuSeqlens);
+        ok = ok && tensors.actualSeqLengths.Create(lengths.data(), shapes.actualSeqLengthsShape, ACL_INT32);
     }
-    ok = ok && tensors.w.Create(nullptr, shapes.qShape, inputDType);
-    ok = ok && tensors.u.Create(nullptr, shapes.vShape, inputDType);
-    ok = ok && tensors.h.Create(nullptr, shapes.hShape, inputDType);
-    ok = ok && tensors.vNew.Create(nullptr, shapes.vShape, inputDType);
+    ok = ok && tensors.initialState.Create(nullptr, shapes.initialStateShape, inputDType);
+    ok = ok && tensors.chunkState.Create(nullptr, shapes.chunkStateShape, inputDType);
     if (params.outputFinalState) {
         ok = ok && tensors.finalState.Create(nullptr, shapes.finalShape, ACL_FLOAT);
     } else {
@@ -486,34 +469,21 @@ bool PrepareChunkGatedDeltaRuleTensors(const Params &params, const PipelineShape
 bool RunChunkGatedDeltaRule(const Params &params, aclDataType inputDType, PipelineTensors &tensors,
                             aclrtStream stream)
 {
-    aclTensor *aSolveInView = params.cuSeqlens.empty() ? nullptr : tensors.aSolveInView.tensor;
-    aclTensor *aSolveOutView = params.cuSeqlens.empty() ? nullptr : tensors.aSolveOutView.tensor;
+    (void)inputDType;
+    const aclTensor *actualSeqLengths = params.cuSeqlens.empty() ? nullptr : tensors.actualSeqLengths.tensor;
     return gdr_aclnn::ChunkGatedDeltaRule(
         tensors.q.tensor,
         tensors.k.tensor,
         tensors.v.tensor,
-        tensors.gIn.tensor,
         tensors.beta.tensor,
-        params.cuSeqlens,
-        params.chunkIndices,
+        tensors.initialState.tensor,
+        actualSeqLengths,
+        tensors.gIn.tensor,
+        static_cast<float>(params.scale),
         params.chunkSize,
-        params.scale,
-        params.outputFinalState,
-        inputDType,
-        tensors.gCum.tensor,
-        tensors.aKktFloat.tensor,
-        tensors.aKktCastBhtd.tensor,
-        tensors.aSolveInStorage.tensor,
-        tensors.aSolveOutStorage.tensor,
-        aSolveInView,
-        aSolveOutView,
-        tensors.aSolveBhtd.tensor,
-        tensors.w.tensor,
-        tensors.u.tensor,
-        tensors.h.tensor,
-        tensors.vNew.tensor,
-        tensors.finalState.tensor,
         tensors.o.tensor,
+        tensors.finalState.tensor,
+        tensors.chunkState.tensor,
         stream);
 }
 
@@ -521,10 +491,8 @@ bool WriteChunkGatedDeltaRuleOutputs(const Params &params, const PipelineTensors
 {
     std::filesystem::create_directories(params.outputDir);
     bool ok = true;
-    ok = ok && WriteTensorFile(params.outputDir / "g.bin", tensors.gCum);
     ok = ok && WriteTensorFile(params.outputDir / "o.bin", tensors.o);
-    ok = ok && WriteTensorFile(params.outputDir / "A.bin", tensors.aSolveBhtd);
-    ok = ok && WriteTensorFile(params.outputDir / "h.bin", tensors.h);
+    ok = ok && WriteTensorFile(params.outputDir / "chunkState.bin", tensors.chunkState);
     if (params.outputFinalState) {
         ok = ok && WriteTensorFile(params.outputDir / "final_state.bin", tensors.finalState);
     }

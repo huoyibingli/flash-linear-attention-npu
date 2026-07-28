@@ -61,6 +61,156 @@ inline int64_t CumsumBlockT(int64_t chunkSize)
     return NextPowerOfTwo((int64_t{1} << 17) / chunkSize);
 }
 
+inline int64_t Numel(const std::vector<int64_t> &shape)
+{
+    int64_t result = 1;
+    for (const auto dim : shape) {
+        result *= dim;
+    }
+    return shape.empty() ? 0 : result;
+}
+
+inline std::vector<int64_t> ContiguousStrides(const std::vector<int64_t> &shape)
+{
+    std::vector<int64_t> strides(shape.size(), 1);
+    for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i) {
+        strides[static_cast<size_t>(i)] = strides[static_cast<size_t>(i + 1)] * shape[static_cast<size_t>(i + 1)];
+    }
+    return strides;
+}
+
+inline size_t DTypeSize(aclDataType dtype)
+{
+    if (dtype == ACL_FLOAT) {
+        return sizeof(float);
+    }
+    if (dtype == ACL_FLOAT16 || dtype == ACL_BF16) {
+        return sizeof(uint16_t);
+    }
+    if (dtype == ACL_INT32) {
+        return sizeof(int32_t);
+    }
+    if (dtype == ACL_INT64) {
+        return sizeof(int64_t);
+    }
+    throw std::runtime_error("unsupported dtype size");
+}
+
+inline aclFormat FormatForDim(size_t dim)
+{
+    if (dim == 3) {
+        return aclFormat::ACL_FORMAT_NCL;
+    }
+    if (dim == 4) {
+        return aclFormat::ACL_FORMAT_NCHW;
+    }
+    if (dim == 5) {
+        return aclFormat::ACL_FORMAT_NCDHW;
+    }
+    return aclFormat::ACL_FORMAT_ND;
+}
+
+inline bool GetTensorShape(const aclTensor *tensor, std::vector<int64_t> &shape)
+{
+    int64_t *dims = nullptr;
+    uint64_t dimsNum = 0;
+    const auto status = aclGetViewShape(tensor, &dims, &dimsNum);
+    if (status != ACL_SUCCESS) {
+        std::cerr << "aclGetViewShape failed: " << status << "\n";
+        return false;
+    }
+    shape.assign(dims, dims + dimsNum);
+    return true;
+}
+
+inline bool GetTensorDType(const aclTensor *tensor, aclDataType &dtype)
+{
+    const auto status = aclGetDataType(tensor, &dtype);
+    if (status != ACL_SUCCESS) {
+        std::cerr << "aclGetDataType failed: " << status << "\n";
+        return false;
+    }
+    return true;
+}
+
+class ManagedTensor {
+public:
+    ~ManagedTensor()
+    {
+        Destroy();
+    }
+
+    bool Create(const std::vector<int64_t> &tensorShape, aclDataType tensorDType)
+    {
+        shape = tensorShape;
+        dtype = tensorDType;
+        bytes = static_cast<size_t>(Numel(shape)) * DTypeSize(dtype);
+        ownsAddr = true;
+        if (bytes > 0) {
+            auto ret = aclrtMalloc(&addr, bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "aclrtMalloc failed: " << ret << "\n";
+                return false;
+            }
+            ret = aclrtMemset(addr, bytes, 0, bytes);
+            if (ret != ACL_SUCCESS) {
+                std::cerr << "aclrtMemset failed: " << ret << "\n";
+                return false;
+            }
+        }
+
+        strides = ContiguousStrides(shape);
+        storageShape = {Numel(shape)};
+        tensor = aclCreateTensor(shape.data(), shape.size(), dtype, strides.data(), 0, FormatForDim(shape.size()),
+                                 storageShape.data(), storageShape.size(), addr);
+        if (tensor == nullptr) {
+            std::cerr << "aclCreateTensor failed\n";
+            return false;
+        }
+        return true;
+    }
+
+    bool CreateView(void *deviceAddr, const std::vector<int64_t> &tensorShape, aclDataType tensorDType)
+    {
+        shape = tensorShape;
+        dtype = tensorDType;
+        bytes = static_cast<size_t>(Numel(shape)) * DTypeSize(dtype);
+        addr = deviceAddr;
+        ownsAddr = false;
+        strides = ContiguousStrides(shape);
+        storageShape = {Numel(shape)};
+        tensor = aclCreateTensor(shape.data(), shape.size(), dtype, strides.data(), 0, FormatForDim(shape.size()),
+                                 storageShape.data(), storageShape.size(), addr);
+        if (tensor == nullptr) {
+            std::cerr << "aclCreateTensor view failed\n";
+            return false;
+        }
+        return true;
+    }
+
+    void Destroy()
+    {
+        if (tensor != nullptr) {
+            aclDestroyTensor(tensor);
+            tensor = nullptr;
+        }
+        if (ownsAddr && addr != nullptr) {
+            aclrtFree(addr);
+        }
+        addr = nullptr;
+        ownsAddr = true;
+    }
+
+    void *addr = nullptr;
+    aclTensor *tensor = nullptr;
+    std::vector<int64_t> shape;
+    std::vector<int64_t> strides;
+    std::vector<int64_t> storageShape;
+    aclDataType dtype = ACL_FLOAT;
+    size_t bytes = 0;
+    bool ownsAddr = true;
+};
+
 class IntArrayHolder {
 public:
     explicit IntArrayHolder(const std::vector<int64_t> &values)
@@ -89,7 +239,109 @@ private:
     aclIntArray *array_ = nullptr;
 };
 
-inline bool ChunkGatedDeltaRule(
+inline bool ReadActualSeqLengths(const aclTensor *actualSeqLengths, std::vector<int64_t> &lengths)
+{
+    lengths.clear();
+    if (actualSeqLengths == nullptr) {
+        return true;
+    }
+
+    std::vector<int64_t> shape;
+    if (!GetTensorShape(actualSeqLengths, shape)) {
+        return false;
+    }
+    if (shape.size() != 1) {
+        std::cerr << "actualSeqLengths expects rank 1\n";
+        return false;
+    }
+
+    aclDataType dtype = ACL_INT32;
+    if (!GetTensorDType(actualSeqLengths, dtype)) {
+        return false;
+    }
+
+    void *deviceAddr = nullptr;
+    auto status = aclGetRawTensorAddr(actualSeqLengths, &deviceAddr);
+    if (status != ACL_SUCCESS || deviceAddr == nullptr) {
+        std::cerr << "aclGetRawTensorAddr(actualSeqLengths) failed: " << status << "\n";
+        return false;
+    }
+
+    const int64_t count = Numel(shape);
+    lengths.resize(static_cast<size_t>(count));
+    if (dtype == ACL_INT32) {
+        std::vector<int32_t> host(static_cast<size_t>(count), 0);
+        auto ret = aclrtMemcpy(host.data(), host.size() * sizeof(int32_t), deviceAddr,
+                               host.size() * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtMemcpy actualSeqLengths D2H failed: " << ret << "\n";
+            return false;
+        }
+        for (int64_t i = 0; i < count; ++i) {
+            lengths[static_cast<size_t>(i)] = host[static_cast<size_t>(i)];
+        }
+    } else if (dtype == ACL_INT64) {
+        auto ret = aclrtMemcpy(lengths.data(), lengths.size() * sizeof(int64_t), deviceAddr,
+                               lengths.size() * sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "aclrtMemcpy actualSeqLengths D2H failed: " << ret << "\n";
+            return false;
+        }
+    } else {
+        std::cerr << "actualSeqLengths expects int32 or int64 dtype\n";
+        return false;
+    }
+
+    return true;
+}
+
+inline std::vector<int64_t> BuildCuSeqlens(const std::vector<int64_t> &actualSeqLengths)
+{
+    if (actualSeqLengths.empty()) {
+        return {};
+    }
+    std::vector<int64_t> cuSeqlens;
+    cuSeqlens.reserve(actualSeqLengths.size() + 1);
+    cuSeqlens.push_back(0);
+    for (const auto len : actualSeqLengths) {
+        cuSeqlens.push_back(cuSeqlens.back() + len);
+    }
+    return cuSeqlens;
+}
+
+inline int64_t CountChunks(const std::vector<int64_t> &lengths, int64_t totalTokens, int64_t chunkSize)
+{
+    if (chunkSize <= 0) {
+        throw std::runtime_error("chunkSize must be positive");
+    }
+    if (lengths.empty()) {
+        return (totalTokens + chunkSize - 1) / chunkSize;
+    }
+    int64_t chunks = 0;
+    for (const auto len : lengths) {
+        chunks += (len + chunkSize - 1) / chunkSize;
+    }
+    return chunks;
+}
+
+inline bool CheckChunkStateShape(const std::vector<int64_t> &chunkStateShape, const std::vector<int64_t> &lengths,
+                                 int64_t totalTokens, int64_t chunkSize)
+{
+    try {
+        const int64_t expectedChunks = CountChunks(lengths, totalTokens, chunkSize);
+        if (chunkStateShape[2] != expectedChunks) {
+            std::cerr << "chunkState total_chunks mismatch, expected " << expectedChunks << ", got "
+                      << chunkStateShape[2] << "\n";
+            return false;
+        }
+    } catch (const std::exception &exc) {
+        std::cerr << exc.what() << "\n";
+        return false;
+    }
+    return true;
+}
+
+inline bool ChunkGatedDeltaRuleImpl(
     const aclTensor *q,
     const aclTensor *k,
     const aclTensor *v,
@@ -99,6 +351,7 @@ inline bool ChunkGatedDeltaRule(
     const std::vector<int64_t> &chunkIndices,
     int64_t chunkSize,
     double scale,
+    const aclTensor *initialState,
     bool outputFinalState,
     aclDataType inputDType,
     aclTensor *gOut,
@@ -111,7 +364,7 @@ inline bool ChunkGatedDeltaRule(
     aclTensor *a,
     aclTensor *w,
     aclTensor *u,
-    aclTensor *h,
+    aclTensor *chunkState,
     aclTensor *vNew,
     aclTensor *finalState,
     aclTensor *o,
@@ -462,13 +715,13 @@ inline bool ChunkGatedDeltaRule(
         }
     }
 
-    // 8. Run the chunk recurrent state update and expose h plus vNew.
+    // 8. Run the chunk recurrent state update and expose chunkState plus vNew.
     {
         uint64_t workspaceSize = 0;
         aclOpExecutor *executor = nullptr;
         auto status = aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
-            k, w, u, gOut, nullptr, nullptr, outputFinalState, chunkSize, true, cuArray.get(), chunkArray.get(),
-            false, false, h, vNew, finalState, &workspaceSize, &executor);
+            k, w, u, gOut, nullptr, initialState, outputFinalState, chunkSize, true, cuArray.get(), chunkArray.get(),
+            false, false, chunkState, vNew, finalState, &workspaceSize, &executor);
         if (status != ACL_SUCCESS) {
             std::cerr << "aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize failed: " << status << "\n";
             return false;
@@ -514,7 +767,8 @@ inline bool ChunkGatedDeltaRule(
         uint64_t workspaceSize = 0;
         aclOpExecutor *executor = nullptr;
         auto status = aclnnChunkFwdOGetWorkspaceSize(
-            q, k, vNew, h, gOut, cuArray.get(), chunkArray.get(), scale, chunkSize, o, &workspaceSize, &executor);
+            q, k, vNew, chunkState, gOut, cuArray.get(), chunkArray.get(), scale, chunkSize, o, &workspaceSize,
+            &executor);
         if (status != ACL_SUCCESS) {
             std::cerr << "aclnnChunkFwdOGetWorkspaceSize failed: " << status << "\n";
             return false;
@@ -556,6 +810,114 @@ inline bool ChunkGatedDeltaRule(
     }
 
     return true;
+}
+
+inline bool ChunkGatedDeltaRule(
+    const aclTensor *query,
+    const aclTensor *key,
+    const aclTensor *value,
+    const aclTensor *beta,
+    const aclTensor *initialState,
+    const aclTensor *actualSeqLengths,
+    const aclTensor *gOptional,
+    float scaleValue,
+    int64_t chunkSize,
+    aclTensor *out,
+    aclTensor *finalState,
+    aclTensor *chunkState,
+    aclrtStream stream)
+{
+    if (query == nullptr || key == nullptr || value == nullptr || beta == nullptr || out == nullptr ||
+        chunkState == nullptr) {
+        std::cerr << "query/key/value/beta/out/chunkState must not be null\n";
+        return false;
+    }
+
+    std::vector<int64_t> queryShape;
+    std::vector<int64_t> valueShape;
+    std::vector<int64_t> chunkStateShape;
+    std::vector<int64_t> finalStateShape;
+    if (!GetTensorShape(query, queryShape) || !GetTensorShape(value, valueShape) ||
+        !GetTensorShape(chunkState, chunkStateShape)) {
+        return false;
+    }
+    if (queryShape.size() != 4 || valueShape.size() != 4 || chunkStateShape.size() != 5) {
+        std::cerr << "current helper expects BHT/BHTD tensors and B,H,chunk,K,V chunkState\n";
+        return false;
+    }
+
+    aclDataType inputDType = ACL_FLOAT16;
+    if (!GetTensorDType(query, inputDType)) {
+        return false;
+    }
+
+    std::vector<int64_t> actualLengths;
+    if (!ReadActualSeqLengths(actualSeqLengths, actualLengths)) {
+        return false;
+    }
+    const std::vector<int64_t> cuSeqlens = BuildCuSeqlens(actualLengths);
+    const bool varlen = !cuSeqlens.empty();
+    const int64_t batch = queryShape[0];
+    const int64_t heads = queryShape[1];
+    const int64_t tokens = queryShape[2];
+    const int64_t keyDim = queryShape[3];
+    const int64_t valueDim = valueShape[3];
+    if (!CheckChunkStateShape(chunkStateShape, actualLengths, tokens, chunkSize)) {
+        return false;
+    }
+    const std::vector<int64_t> chunkIndices = varlen ? BuildChunkIndices(cuSeqlens, chunkSize) : std::vector<int64_t>{};
+
+    const std::vector<int64_t> gateShape = {batch, heads, tokens};
+    const std::vector<int64_t> aShape = {batch, heads, tokens, chunkSize};
+    const std::vector<int64_t> aSolveStorageShape = {batch, tokens, heads, chunkSize};
+    const std::vector<int64_t> aSolveViewShape = {tokens, heads, chunkSize};
+
+    ManagedTensor zeroG;
+    const aclTensor *g = gOptional;
+    if (g == nullptr) {
+        if (!zeroG.Create(gateShape, ACL_FLOAT)) {
+            return false;
+        }
+        g = zeroG.tensor;
+    }
+
+    ManagedTensor gOut;
+    ManagedTensor aKktFloat;
+    ManagedTensor aKktCastBhtd;
+    ManagedTensor aSolveInStorage;
+    ManagedTensor aSolveOutStorage;
+    ManagedTensor aSolveInView;
+    ManagedTensor aSolveOutView;
+    ManagedTensor a;
+    ManagedTensor w;
+    ManagedTensor u;
+    ManagedTensor vNew;
+    if (!gOut.Create(gateShape, ACL_FLOAT) || !aKktFloat.Create(aShape, ACL_FLOAT) ||
+        !aKktCastBhtd.Create(aShape, inputDType) || !aSolveInStorage.Create(aSolveStorageShape, inputDType) ||
+        !aSolveOutStorage.Create(aSolveStorageShape, inputDType) || !a.Create(aShape, inputDType) ||
+        !w.Create(queryShape, inputDType) || !u.Create(valueShape, inputDType) ||
+        !vNew.Create(valueShape, inputDType)) {
+        return false;
+    }
+    if (varlen) {
+        if (!aSolveInView.CreateView(aSolveInStorage.addr, aSolveViewShape, inputDType) ||
+            !aSolveOutView.CreateView(aSolveOutStorage.addr, aSolveViewShape, inputDType)) {
+            return false;
+        }
+    }
+
+    std::vector<int64_t> finalShape;
+    bool outputFinalState = false;
+    if (finalState != nullptr && GetTensorShape(finalState, finalShape)) {
+        outputFinalState = finalShape.size() == 4;
+    }
+
+    return ChunkGatedDeltaRuleImpl(
+        query, key, value, g, beta, cuSeqlens, chunkIndices, chunkSize, scaleValue, initialState, outputFinalState,
+        inputDType,
+        gOut.tensor, aKktFloat.tensor, aKktCastBhtd.tensor, aSolveInStorage.tensor, aSolveOutStorage.tensor,
+        varlen ? aSolveInView.tensor : nullptr, varlen ? aSolveOutView.tensor : nullptr, a.tensor, w.tensor, u.tensor,
+        chunkState, vNew.tensor, finalState, out, stream);
 }
 
 }  // namespace gdr_aclnn
