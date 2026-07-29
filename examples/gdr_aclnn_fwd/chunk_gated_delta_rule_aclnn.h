@@ -239,6 +239,56 @@ private:
     aclIntArray *array_ = nullptr;
 };
 
+// Runs aclnnPermute with the two-stage ACLNN API. The TND adapter uses this
+// helper so layout conversion stays on device instead of doing host-side copies.
+inline bool RunAclnnPermute(const aclTensor *input, const std::vector<int64_t> &dims, aclTensor *output,
+                            aclrtStream stream, const char *name)
+{
+    IntArrayHolder dimArray(dims);
+    uint64_t workspaceSize = 0;
+    aclOpExecutor *executor = nullptr;
+    auto status = aclnnPermuteGetWorkspaceSize(input, dimArray.get(), output, &workspaceSize, &executor);
+    if (status != ACL_SUCCESS) {
+        std::cerr << "aclnnPermuteGetWorkspaceSize failed for " << name << ": " << status << "\n";
+        return false;
+    }
+
+    void *workspace = nullptr;
+    if (workspaceSize > 0) {
+        auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "workspace aclrtMalloc failed for " << name << ": " << ret << "\n";
+            return false;
+        }
+    }
+
+    status = aclnnPermute(workspace, workspaceSize, executor, stream);
+    if (status != ACL_SUCCESS) {
+        std::cerr << "aclnnPermute failed for " << name << ": " << status << "\n";
+        if (workspace != nullptr) {
+            aclrtFree(workspace);
+        }
+        return false;
+    }
+
+    auto ret = aclrtSynchronizeStream(stream);
+    if (ret != ACL_SUCCESS) {
+        std::cerr << "aclrtSynchronizeStream failed after " << name << ": " << ret << "\n";
+        if (workspace != nullptr) {
+            aclrtFree(workspace);
+        }
+        return false;
+    }
+    if (workspace != nullptr) {
+        ret = aclrtFree(workspace);
+        if (ret != ACL_SUCCESS) {
+            std::cerr << "workspace aclrtFree failed for " << name << ": " << ret << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool ReadActualSeqLengths(const aclTensor *actualSeqLengths, std::vector<int64_t> &lengths)
 {
     lengths.clear();
@@ -812,7 +862,10 @@ inline bool ChunkGatedDeltaRuleImpl(
     return true;
 }
 
-inline bool ChunkGatedDeltaRule(
+// Internal entry for the historical example layout:
+// q/k [B,H,T,K], value/out [B,H,T,V], beta/g [B,H,T],
+// state [stateCount,H,K,V], chunkState [B,H,totalChunks,K,V].
+inline bool ChunkGatedDeltaRuleBhtd(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -918,6 +971,251 @@ inline bool ChunkGatedDeltaRule(
         gOut.tensor, aKktFloat.tensor, aKktCastBhtd.tensor, aSolveInStorage.tensor, aSolveOutStorage.tensor,
         varlen ? aSolveInView.tensor : nullptr, varlen ? aSolveOutView.tensor : nullptr, a.tensor, w.tensor, u.tensor,
         chunkState, vNew.tensor, finalState, out, stream);
+}
+
+// README-shape adapter used to replace fused aclnnChunkGatedDeltaRule calls
+// while keeping the stitched small-operator implementation underneath.
+//
+// Public shape contract:
+//   query/key:       [T,Nk,Dk]
+//   value/out:       [T,Nv,Dv]
+//   beta/gOptional:  [T,Nv]
+//   initial/final:   [B,Nv,Dv,Dk]
+//   actualSeqLengths:[B]
+//   chunkState:      [totalChunks,Nv,Dv,Dk]
+//
+// Compared with the fused op, chunkState and chunkSize are explicit here.
+// The current stitched path has one head dimension, so this adapter requires
+// Nk == Nv.
+inline bool ChunkGatedDeltaRuleTnd(
+    const aclTensor *query,
+    const aclTensor *key,
+    const aclTensor *value,
+    const aclTensor *beta,
+    const aclTensor *initialState,
+    const aclTensor *actualSeqLengths,
+    const aclTensor *gOptional,
+    float scaleValue,
+    int64_t chunkSize,
+    aclTensor *out,
+    aclTensor *finalState,
+    aclTensor *chunkState,
+    aclrtStream stream)
+{
+    if (query == nullptr || key == nullptr || value == nullptr || beta == nullptr || initialState == nullptr ||
+        actualSeqLengths == nullptr || out == nullptr || finalState == nullptr || chunkState == nullptr) {
+        std::cerr << "query/key/value/beta/initialState/actualSeqLengths/out/finalState/chunkState must not be null\n";
+        return false;
+    }
+
+    // Read and validate the README/TND public tensor shapes before allocating
+    // any temporary device buffers.
+    std::vector<int64_t> queryShape;
+    std::vector<int64_t> keyShape;
+    std::vector<int64_t> valueShape;
+    std::vector<int64_t> betaShape;
+    std::vector<int64_t> initialStateShape;
+    std::vector<int64_t> outShape;
+    std::vector<int64_t> finalStateShape;
+    std::vector<int64_t> chunkStateShape;
+    if (!GetTensorShape(query, queryShape) || !GetTensorShape(key, keyShape) || !GetTensorShape(value, valueShape) ||
+        !GetTensorShape(beta, betaShape) || !GetTensorShape(initialState, initialStateShape) ||
+        !GetTensorShape(out, outShape) || !GetTensorShape(finalState, finalStateShape) ||
+        !GetTensorShape(chunkState, chunkStateShape)) {
+        return false;
+    }
+    if (queryShape.size() != 3 || keyShape.size() != 3 || valueShape.size() != 3 || betaShape.size() != 2 ||
+        initialStateShape.size() != 4 || outShape.size() != 3 || finalStateShape.size() != 4 ||
+        chunkStateShape.size() != 4) {
+        std::cerr << "TND overload expects q/k/value/out rank 3, beta rank 2, state/chunkState rank 4\n";
+        return false;
+    }
+
+    const int64_t tokens = queryShape[0];
+    const int64_t keyHeads = queryShape[1];
+    const int64_t keyDim = queryShape[2];
+    const int64_t valueHeads = valueShape[1];
+    const int64_t valueDim = valueShape[2];
+    if (keyShape != queryShape || valueShape[0] != tokens || betaShape[0] != tokens || betaShape[1] != valueHeads ||
+        outShape != valueShape) {
+        std::cerr << "TND q/k/value/beta/out shapes do not match README layout constraints\n";
+        return false;
+    }
+    if (keyHeads != valueHeads) {
+        std::cerr << "TND overload currently requires Nk == Nv because the stitched helper has one head dimension\n";
+        return false;
+    }
+
+    // actualSeqLengths defines both the batch count and the chunk metadata used
+    // by the internal BHTD implementation.
+    std::vector<int64_t> actualLengths;
+    if (!ReadActualSeqLengths(actualSeqLengths, actualLengths) || actualLengths.empty()) {
+        return false;
+    }
+    int64_t totalTokens = 0;
+    for (const auto len : actualLengths) {
+        if (len <= 0) {
+            std::cerr << "actualSeqLengths entries must be positive\n";
+            return false;
+        }
+        totalTokens += len;
+    }
+    if (totalTokens != tokens) {
+        std::cerr << "sum(actualSeqLengths) must equal T, got " << totalTokens << " vs " << tokens << "\n";
+        return false;
+    }
+    const int64_t batch = static_cast<int64_t>(actualLengths.size());
+    const int64_t totalChunks = CountChunks(actualLengths, tokens, chunkSize);
+    if (initialStateShape != std::vector<int64_t>{batch, valueHeads, valueDim, keyDim} ||
+        finalStateShape != initialStateShape ||
+        chunkStateShape != std::vector<int64_t>{totalChunks, valueHeads, valueDim, keyDim}) {
+        std::cerr << "TND state shapes expect initial/final [B,Nv,Dv,Dk] and chunkState [totalChunks,Nv,Dv,Dk]\n";
+        return false;
+    }
+
+    aclDataType inputDType = ACL_FLOAT16;
+    if (!GetTensorDType(query, inputDType)) {
+        return false;
+    }
+
+    // Temporary tensors hold the internal layout expected by the stitched
+    // small-operator path. Rank-3 HTD/HT tensors are later viewed as BHTD/BHT
+    // with B=1, matching the existing varlen convention.
+    ManagedTensor queryHtd;
+    ManagedTensor keyHtd;
+    ManagedTensor valueHtd;
+    ManagedTensor betaHt;
+    ManagedTensor gHt;
+    ManagedTensor queryBhtdView;
+    ManagedTensor keyBhtdView;
+    ManagedTensor valueBhtdView;
+    ManagedTensor betaBhtView;
+    ManagedTensor gBhtView;
+    ManagedTensor initialStateBhkv;
+    ManagedTensor outBhtd;
+    ManagedTensor finalStateBhkv;
+    ManagedTensor chunkStateInternal;
+    ManagedTensor outHtdView;
+    ManagedTensor chunkStateHckvView;
+
+    if (!queryHtd.Create({valueHeads, tokens, keyDim}, inputDType) ||
+        !keyHtd.Create({valueHeads, tokens, keyDim}, inputDType) ||
+        !valueHtd.Create({valueHeads, tokens, valueDim}, inputDType) ||
+        !betaHt.Create({valueHeads, tokens}, ACL_FLOAT) ||
+        !initialStateBhkv.Create({batch, valueHeads, keyDim, valueDim}, inputDType) ||
+        !outBhtd.Create({1, valueHeads, tokens, valueDim}, inputDType) ||
+        !finalStateBhkv.Create({batch, valueHeads, keyDim, valueDim}, inputDType) ||
+        !chunkStateInternal.Create({1, valueHeads, totalChunks, keyDim, valueDim}, inputDType)) {
+        return false;
+    }
+
+    // g is optional in the public interface. If present, convert it from
+    // [T,Nv] to [Nv,T] and then expose it as a [1,Nv,T] view.
+    const aclTensor *gBhtTensor = nullptr;
+    if (gOptional != nullptr) {
+        std::vector<int64_t> gShape;
+        if (!GetTensorShape(gOptional, gShape)) {
+            return false;
+        }
+        if (gShape != std::vector<int64_t>{tokens, valueHeads}) {
+            std::cerr << "gOptional expects [T,Nv]\n";
+            return false;
+        }
+        if (!gHt.Create({valueHeads, tokens}, ACL_FLOAT)) {
+            return false;
+        }
+    }
+
+    // Convert README layout to the internal layout on device.
+    if (!RunAclnnPermute(query, {1, 0, 2}, queryHtd.tensor, stream, "query TND->HTD") ||
+        !RunAclnnPermute(key, {1, 0, 2}, keyHtd.tensor, stream, "key TND->HTD") ||
+        !RunAclnnPermute(value, {1, 0, 2}, valueHtd.tensor, stream, "value TND->HTD") ||
+        !RunAclnnPermute(beta, {1, 0}, betaHt.tensor, stream, "beta TN->NT") ||
+        !RunAclnnPermute(initialState, {0, 1, 3, 2}, initialStateBhkv.tensor, stream,
+                         "initialState B,Nv,Dv,Dk->B,Nv,Dk,Dv")) {
+        return false;
+    }
+    if (gOptional != nullptr) {
+        if (!RunAclnnPermute(gOptional, {1, 0}, gHt.tensor, stream, "g TN->NT")) {
+            return false;
+        }
+        if (!gBhtView.CreateView(gHt.addr, {1, valueHeads, tokens}, ACL_FLOAT)) {
+            return false;
+        }
+        gBhtTensor = gBhtView.tensor;
+    }
+
+    // Add the synthetic batch dimension required by the existing BHTD helper.
+    if (!queryBhtdView.CreateView(queryHtd.addr, {1, valueHeads, tokens, keyDim}, inputDType) ||
+        !keyBhtdView.CreateView(keyHtd.addr, {1, valueHeads, tokens, keyDim}, inputDType) ||
+        !valueBhtdView.CreateView(valueHtd.addr, {1, valueHeads, tokens, valueDim}, inputDType) ||
+        !betaBhtView.CreateView(betaHt.addr, {1, valueHeads, tokens}, ACL_FLOAT)) {
+        return false;
+    }
+
+    // Execute the original stitched implementation.
+    if (!ChunkGatedDeltaRuleBhtd(
+            queryBhtdView.tensor, keyBhtdView.tensor, valueBhtdView.tensor, betaBhtView.tensor,
+            initialStateBhkv.tensor, actualSeqLengths, gBhtTensor, scaleValue, chunkSize, outBhtd.tensor,
+            finalStateBhkv.tensor, chunkStateInternal.tensor, stream)) {
+        return false;
+    }
+
+    // Convert internal outputs back to README layout. chunkState is exposed as
+    // [totalChunks,Nv,Dv,Dk] so callers can inspect the per-chunk state matrix.
+    if (!outHtdView.CreateView(outBhtd.addr, {valueHeads, tokens, valueDim}, inputDType) ||
+        !chunkStateHckvView.CreateView(chunkStateInternal.addr, {valueHeads, totalChunks, keyDim, valueDim},
+                                       inputDType)) {
+        return false;
+    }
+    if (!RunAclnnPermute(outHtdView.tensor, {1, 0, 2}, out, stream, "out HTD->TND") ||
+        !RunAclnnPermute(finalStateBhkv.tensor, {0, 1, 3, 2}, finalState, stream,
+                         "finalState B,Nv,Dk,Dv->B,Nv,Dv,Dk") ||
+        !RunAclnnPermute(chunkStateHckvView.tensor, {1, 0, 3, 2}, chunkState, stream,
+                         "chunkState Nv,C,Dk,Dv->C,Nv,Dv,Dk")) {
+        return false;
+    }
+
+    return true;
+}
+
+// Public dispatching entry. Rank-3 query tensors are treated as README/TND
+// calls, while rank-4 query tensors preserve the original BHTD example API.
+inline bool ChunkGatedDeltaRule(
+    const aclTensor *query,
+    const aclTensor *key,
+    const aclTensor *value,
+    const aclTensor *beta,
+    const aclTensor *initialState,
+    const aclTensor *actualSeqLengths,
+    const aclTensor *gOptional,
+    float scaleValue,
+    int64_t chunkSize,
+    aclTensor *out,
+    aclTensor *finalState,
+    aclTensor *chunkState,
+    aclrtStream stream)
+{
+    if (query == nullptr) {
+        std::cerr << "query must not be null\n";
+        return false;
+    }
+    std::vector<int64_t> queryShape;
+    if (!GetTensorShape(query, queryShape)) {
+        return false;
+    }
+    if (queryShape.size() == 3) {
+        return ChunkGatedDeltaRuleTnd(
+            query, key, value, beta, initialState, actualSeqLengths, gOptional, scaleValue, chunkSize, out, finalState,
+            chunkState, stream);
+    }
+    if (queryShape.size() == 4) {
+        return ChunkGatedDeltaRuleBhtd(
+            query, key, value, beta, initialState, actualSeqLengths, gOptional, scaleValue, chunkSize, out, finalState,
+            chunkState, stream);
+    }
+    std::cerr << "ChunkGatedDeltaRule expects README TND rank 3 or internal BHTD rank 4 query\n";
+    return false;
 }
 
 }  // namespace gdr_aclnn
