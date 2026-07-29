@@ -34,6 +34,8 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSolveTri(
 
 namespace gdr_aclnn {
 
+constexpr aclnnStatus GDR_ACLNN_STATUS_FAILED = ACL_ERROR_RT_PARAM_INVALID;
+
 inline std::vector<int64_t> BuildChunkIndices(const std::vector<int64_t> &cuSeqlens, int64_t chunkSize)
 {
     std::vector<int64_t> result;
@@ -239,18 +241,15 @@ private:
     aclIntArray *array_ = nullptr;
 };
 
-// Runs aclnnPermute with the two-stage ACLNN API. The TND adapter uses this
-// helper so layout conversion stays on device instead of doing host-side copies.
-inline bool RunAclnnPermute(const aclTensor *input, const std::vector<int64_t> &dims, aclTensor *output,
-                            aclrtStream stream, const char *name)
+template <typename GetWorkspaceFn, typename RunFn>
+inline aclnnStatus RunAclnnOperator(const char *name, GetWorkspaceFn getWorkspaceSize, RunFn run, aclrtStream stream)
 {
-    IntArrayHolder dimArray(dims);
     uint64_t workspaceSize = 0;
     aclOpExecutor *executor = nullptr;
-    auto status = aclnnPermuteGetWorkspaceSize(input, dimArray.get(), output, &workspaceSize, &executor);
+    auto status = getWorkspaceSize(&workspaceSize, &executor);
     if (status != ACL_SUCCESS) {
-        std::cerr << "aclnnPermuteGetWorkspaceSize failed for " << name << ": " << status << "\n";
-        return false;
+        std::cerr << name << " GetWorkspaceSize failed: " << status << "\n";
+        return status;
     }
 
     void *workspace = nullptr;
@@ -258,17 +257,17 @@ inline bool RunAclnnPermute(const aclTensor *input, const std::vector<int64_t> &
         auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
         if (ret != ACL_SUCCESS) {
             std::cerr << "workspace aclrtMalloc failed for " << name << ": " << ret << "\n";
-            return false;
+            return ret;
         }
     }
 
-    status = aclnnPermute(workspace, workspaceSize, executor, stream);
+    status = run(workspace, workspaceSize, executor, stream);
     if (status != ACL_SUCCESS) {
-        std::cerr << "aclnnPermute failed for " << name << ": " << status << "\n";
+        std::cerr << name << " failed: " << status << "\n";
         if (workspace != nullptr) {
             aclrtFree(workspace);
         }
-        return false;
+        return status;
     }
 
     auto ret = aclrtSynchronizeStream(stream);
@@ -277,16 +276,34 @@ inline bool RunAclnnPermute(const aclTensor *input, const std::vector<int64_t> &
         if (workspace != nullptr) {
             aclrtFree(workspace);
         }
-        return false;
+        return ret;
     }
+
     if (workspace != nullptr) {
         ret = aclrtFree(workspace);
         if (ret != ACL_SUCCESS) {
             std::cerr << "workspace aclrtFree failed for " << name << ": " << ret << "\n";
-            return false;
+            return ret;
         }
     }
-    return true;
+    return ACL_SUCCESS;
+}
+
+// Runs aclnnPermute with the two-stage ACLNN API. The TND adapter uses this
+// helper so layout conversion stays on device instead of doing host-side copies.
+inline aclnnStatus RunAclnnPermute(const aclTensor *input, const std::vector<int64_t> &dims, aclTensor *output,
+                                   aclrtStream stream, const char *name)
+{
+    IntArrayHolder dimArray(dims);
+    return RunAclnnOperator(
+        name,
+        [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+            return aclnnPermuteGetWorkspaceSize(input, dimArray.get(), output, workspaceSize, executor);
+        },
+        [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+            return aclnnPermute(workspace, workspaceSize, executor, stream);
+        },
+        stream);
 }
 
 inline bool ReadActualSeqLengths(const aclTensor *actualSeqLengths, std::vector<int64_t> &lengths)
@@ -391,7 +408,7 @@ inline bool CheckChunkStateShape(const std::vector<int64_t> &chunkStateShape, co
     return true;
 }
 
-inline bool ChunkGatedDeltaRuleImpl(
+inline aclnnStatus ChunkGatedDeltaRuleImpl(
     const aclTensor *q,
     const aclTensor *k,
     const aclTensor *v,
@@ -425,7 +442,7 @@ inline bool ChunkGatedDeltaRuleImpl(
     const bool varlen = !cuSeqlens.empty();
     if (varlen && (aSolveInView == nullptr || aSolveOutView == nullptr)) {
         std::cerr << "varlen mode requires explicit solve_tri TND view tensors\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     const std::vector<int64_t> cumsumChunkIndices =
@@ -439,186 +456,69 @@ inline bool ChunkGatedDeltaRuleImpl(
 
     // 1. Accumulate gate values inside each chunk: g[B,H,T] -> gOut[B,H,T] in fp32.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnChunkLocalCumsumGetWorkspaceSize(
-            g, cuArray.get(), cumsumChunkArray.get(), chunkSize, false, 1.0, true, outputDtype, gOut,
-            &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnChunkLocalCumsum",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnChunkLocalCumsumGetWorkspaceSize(
+                    g, cuArray.get(), cumsumChunkArray.get(), chunkSize, false, 1.0, true, outputDtype, gOut,
+                    workspaceSize, executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnChunkLocalCumsum(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkLocalCumsumGetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnChunkLocalCumsum: " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnChunkLocalCumsum(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkLocalCumsum failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkLocalCumsum: " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnChunkLocalCumsum: " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 2. Build KKT matrix in fp32 for numerical stability.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnChunkScaledDotKktGetWorkspaceSize(
-            k, gOut, beta, cuArray.get(), chunkArray.get(), chunkSize, aKktFloat, &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnChunkScaledDotKkt",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnChunkScaledDotKktGetWorkspaceSize(
+                    k, gOut, beta, cuArray.get(), chunkArray.get(), chunkSize, aKktFloat, workspaceSize, executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnChunkScaledDotKkt(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkScaledDotKktGetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnChunkScaledDotKkt: " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnChunkScaledDotKkt(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkScaledDotKkt failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkScaledDotKkt: " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnChunkScaledDotKkt: " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 3. Cast KKT back to the input storage dtype before solve_tri.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status =
-            aclnnCastGetWorkspaceSize(aKktFloat, inputDType, aKktCastBhtd, &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnCast(A_kkt)",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnCastGetWorkspaceSize(aKktFloat, inputDType, aKktCastBhtd, workspaceSize, executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnCast(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnCast(A_kkt)GetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnCast(A_kkt): " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnCast(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnCast(A_kkt) failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnCast(A_kkt): " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnCast(A_kkt): " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 4. Convert A from BHTD storage to solve_tri's expected BSND/TND memory order.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnPermuteGetWorkspaceSize(
-            aKktCastBhtd, solvePermArray.get(), aSolveInStorage, &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnPermute(A_to_solve)",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnPermuteGetWorkspaceSize(
+                    aKktCastBhtd, solvePermArray.get(), aSolveInStorage, workspaceSize, executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnPermute(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnPermute(A_to_solve)GetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnPermute(A_to_solve): " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnPermute(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnPermute(A_to_solve) failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnPermute(A_to_solve): " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnPermute(A_to_solve): " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
@@ -628,244 +528,99 @@ inline bool ChunkGatedDeltaRuleImpl(
 
     // 5. Solve the per-chunk triangular system.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnSolveTriGetWorkspaceSize(
-            solveInTensor, cuArray.get(), chunkArray.get(), solveLayout, solveOutTensor, &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnSolveTri",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnSolveTriGetWorkspaceSize(
+                    solveInTensor, cuArray.get(), chunkArray.get(), solveLayout, solveOutTensor, workspaceSize,
+                    executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnSolveTri(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnSolveTriGetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnSolveTri: " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnSolveTri(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnSolveTri failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnSolveTri: " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnSolveTri: " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 6. Convert solved A back to the external BHTD layout.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status =
-            aclnnPermuteGetWorkspaceSize(aSolveOutStorage, solvePermArray.get(), a, &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnPermute(A_to_bhtd)",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnPermuteGetWorkspaceSize(aSolveOutStorage, solvePermArray.get(), a, workspaceSize, executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnPermute(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnPermute(A_to_bhtd)GetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnPermute(A_to_bhtd): " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnPermute(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnPermute(A_to_bhtd) failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnPermute(A_to_bhtd): " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnPermute(A_to_bhtd): " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 7. Recompute W and U from k, v, beta, solved A, and cumulative gates.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnRecomputeWUFwdGetWorkspaceSize(
-            k, v, beta, a, gOut, nullptr, cuArray.get(), chunkArray.get(), chunkSize, w, u, &workspaceSize,
-            &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnRecomputeWUFwd",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnRecomputeWUFwdGetWorkspaceSize(
+                    k, v, beta, a, gOut, nullptr, cuArray.get(), chunkArray.get(), chunkSize, w, u, workspaceSize,
+                    executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnRecomputeWUFwd(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnRecomputeWUFwdGetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnRecomputeWUFwd: " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnRecomputeWUFwd(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnRecomputeWUFwd failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnRecomputeWUFwd: " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnRecomputeWUFwd: " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 8. Run the chunk recurrent state update and expose chunkState plus vNew.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
-            k, w, u, gOut, nullptr, initialState, outputFinalState, chunkSize, true, cuArray.get(), chunkArray.get(),
-            false, false, chunkState, vNew, finalState, &workspaceSize, &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnChunkGatedDeltaRuleFwdH",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
+                    k, w, u, gOut, nullptr, initialState, outputFinalState, chunkSize, true, cuArray.get(),
+                    chunkArray.get(), false, false, chunkState, vNew, finalState, workspaceSize, executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnChunkGatedDeltaRuleFwdH(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnChunkGatedDeltaRuleFwdH: " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnChunkGatedDeltaRuleFwdH(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkGatedDeltaRuleFwdH failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkGatedDeltaRuleFwdH: " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnChunkGatedDeltaRuleFwdH: " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
     // 9. Compute final attention output o from q, k, vNew, h, and cumulative gates.
     {
-        uint64_t workspaceSize = 0;
-        aclOpExecutor *executor = nullptr;
-        auto status = aclnnChunkFwdOGetWorkspaceSize(
-            q, k, vNew, chunkState, gOut, cuArray.get(), chunkArray.get(), scale, chunkSize, o, &workspaceSize,
-            &executor);
+        const auto status = RunAclnnOperator(
+            "aclnnChunkFwdO",
+            [&](uint64_t *workspaceSize, aclOpExecutor **executor) {
+                return aclnnChunkFwdOGetWorkspaceSize(
+                    q, k, vNew, chunkState, gOut, cuArray.get(), chunkArray.get(), scale, chunkSize, o, workspaceSize,
+                    executor);
+            },
+            [](void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
+                return aclnnChunkFwdO(workspace, workspaceSize, executor, stream);
+            },
+            stream);
         if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkFwdOGetWorkspaceSize failed: " << status << "\n";
-            return false;
-        }
-
-        void *workspace = nullptr;
-        if (workspaceSize > 0) {
-            auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtMalloc failed for aclnnChunkFwdO: " << ret << "\n";
-                return false;
-            }
-        }
-
-        status = aclnnChunkFwdO(workspace, workspaceSize, executor, stream);
-        if (status != ACL_SUCCESS) {
-            std::cerr << "aclnnChunkFwdO failed: " << status << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-
-        auto ret = aclrtSynchronizeStream(stream);
-        if (ret != ACL_SUCCESS) {
-            std::cerr << "aclrtSynchronizeStream failed after aclnnChunkFwdO: " << ret << "\n";
-            if (workspace != nullptr) {
-                aclrtFree(workspace);
-            }
-            return false;
-        }
-        if (workspace != nullptr) {
-            ret = aclrtFree(workspace);
-            if (ret != ACL_SUCCESS) {
-                std::cerr << "workspace aclrtFree failed for aclnnChunkFwdO: " << ret << "\n";
-                return false;
-            }
+            return status;
         }
     }
 
-    return true;
+    return ACL_SUCCESS;
 }
 
 // Internal entry for the historical example layout:
 // q/k [B,H,T,K], value/out [B,H,T,V], beta/g [B,H,T],
 // state [stateCount,H,K,V], chunkState [B,H,totalChunks,K,V].
-inline bool ChunkGatedDeltaRuleBhtd(
+inline aclnnStatus ChunkGatedDeltaRuleBhtd(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -883,7 +638,7 @@ inline bool ChunkGatedDeltaRuleBhtd(
     if (query == nullptr || key == nullptr || value == nullptr || beta == nullptr || out == nullptr ||
         chunkState == nullptr) {
         std::cerr << "query/key/value/beta/out/chunkState must not be null\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     std::vector<int64_t> queryShape;
@@ -892,21 +647,21 @@ inline bool ChunkGatedDeltaRuleBhtd(
     std::vector<int64_t> finalStateShape;
     if (!GetTensorShape(query, queryShape) || !GetTensorShape(value, valueShape) ||
         !GetTensorShape(chunkState, chunkStateShape)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     if (queryShape.size() != 4 || valueShape.size() != 4 || chunkStateShape.size() != 5) {
         std::cerr << "current helper expects BHT/BHTD tensors and B,H,chunk,K,V chunkState\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     aclDataType inputDType = ACL_FLOAT16;
     if (!GetTensorDType(query, inputDType)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     std::vector<int64_t> actualLengths;
     if (!ReadActualSeqLengths(actualSeqLengths, actualLengths)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     const std::vector<int64_t> cuSeqlens = BuildCuSeqlens(actualLengths);
     const bool varlen = !cuSeqlens.empty();
@@ -916,7 +671,7 @@ inline bool ChunkGatedDeltaRuleBhtd(
     const int64_t keyDim = queryShape[3];
     const int64_t valueDim = valueShape[3];
     if (!CheckChunkStateShape(chunkStateShape, actualLengths, tokens, chunkSize)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     const std::vector<int64_t> chunkIndices = varlen ? BuildChunkIndices(cuSeqlens, chunkSize) : std::vector<int64_t>{};
 
@@ -929,7 +684,7 @@ inline bool ChunkGatedDeltaRuleBhtd(
     const aclTensor *g = gOptional;
     if (g == nullptr) {
         if (!zeroG.Create(gateShape, ACL_FLOAT)) {
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
         g = zeroG.tensor;
     }
@@ -950,12 +705,12 @@ inline bool ChunkGatedDeltaRuleBhtd(
         !aSolveOutStorage.Create(aSolveStorageShape, inputDType) || !a.Create(aShape, inputDType) ||
         !w.Create(queryShape, inputDType) || !u.Create(valueShape, inputDType) ||
         !vNew.Create(valueShape, inputDType)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     if (varlen) {
         if (!aSolveInView.CreateView(aSolveInStorage.addr, aSolveViewShape, inputDType) ||
             !aSolveOutView.CreateView(aSolveOutStorage.addr, aSolveViewShape, inputDType)) {
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
     }
 
@@ -987,7 +742,7 @@ inline bool ChunkGatedDeltaRuleBhtd(
 // Compared with the fused op, chunkState and chunkSize are explicit here.
 // The current stitched path has one head dimension, so this adapter requires
 // Nk == Nv.
-inline bool ChunkGatedDeltaRuleTnd(
+inline aclnnStatus ChunkGatedDeltaRuleTnd(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -1005,7 +760,7 @@ inline bool ChunkGatedDeltaRuleTnd(
     if (query == nullptr || key == nullptr || value == nullptr || beta == nullptr || initialState == nullptr ||
         actualSeqLengths == nullptr || out == nullptr || finalState == nullptr || chunkState == nullptr) {
         std::cerr << "query/key/value/beta/initialState/actualSeqLengths/out/finalState/chunkState must not be null\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     // Read and validate the README/TND public tensor shapes before allocating
@@ -1022,13 +777,13 @@ inline bool ChunkGatedDeltaRuleTnd(
         !GetTensorShape(beta, betaShape) || !GetTensorShape(initialState, initialStateShape) ||
         !GetTensorShape(out, outShape) || !GetTensorShape(finalState, finalStateShape) ||
         !GetTensorShape(chunkState, chunkStateShape)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     if (queryShape.size() != 3 || keyShape.size() != 3 || valueShape.size() != 3 || betaShape.size() != 2 ||
         initialStateShape.size() != 4 || outShape.size() != 3 || finalStateShape.size() != 4 ||
         chunkStateShape.size() != 4) {
         std::cerr << "TND overload expects q/k/value/out rank 3, beta rank 2, state/chunkState rank 4\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     const int64_t tokens = queryShape[0];
@@ -1039,30 +794,30 @@ inline bool ChunkGatedDeltaRuleTnd(
     if (keyShape != queryShape || valueShape[0] != tokens || betaShape[0] != tokens || betaShape[1] != valueHeads ||
         outShape != valueShape) {
         std::cerr << "TND q/k/value/beta/out shapes do not match README layout constraints\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     if (keyHeads != valueHeads) {
         std::cerr << "TND overload currently requires Nk == Nv because the stitched helper has one head dimension\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     // actualSeqLengths defines both the batch count and the chunk metadata used
     // by the internal BHTD implementation.
     std::vector<int64_t> actualLengths;
     if (!ReadActualSeqLengths(actualSeqLengths, actualLengths) || actualLengths.empty()) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     int64_t totalTokens = 0;
     for (const auto len : actualLengths) {
         if (len <= 0) {
             std::cerr << "actualSeqLengths entries must be positive\n";
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
         totalTokens += len;
     }
     if (totalTokens != tokens) {
         std::cerr << "sum(actualSeqLengths) must equal T, got " << totalTokens << " vs " << tokens << "\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     const int64_t batch = static_cast<int64_t>(actualLengths.size());
     const int64_t totalChunks = CountChunks(actualLengths, tokens, chunkSize);
@@ -1070,12 +825,12 @@ inline bool ChunkGatedDeltaRuleTnd(
         finalStateShape != initialStateShape ||
         chunkStateShape != std::vector<int64_t>{totalChunks, valueHeads, valueDim, keyDim}) {
         std::cerr << "TND state shapes expect initial/final [B,Nv,Dv,Dk] and chunkState [totalChunks,Nv,Dv,Dk]\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     aclDataType inputDType = ACL_FLOAT16;
     if (!GetTensorDType(query, inputDType)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     // Temporary tensors hold the internal layout expected by the stitched
@@ -1106,7 +861,7 @@ inline bool ChunkGatedDeltaRuleTnd(
         !outBhtd.Create({1, valueHeads, tokens, valueDim}, inputDType) ||
         !finalStateBhkv.Create({batch, valueHeads, keyDim, valueDim}, inputDType) ||
         !chunkStateInternal.Create({1, valueHeads, totalChunks, keyDim, valueDim}, inputDType)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     // g is optional in the public interface. If present, convert it from
@@ -1115,32 +870,47 @@ inline bool ChunkGatedDeltaRuleTnd(
     if (gOptional != nullptr) {
         std::vector<int64_t> gShape;
         if (!GetTensorShape(gOptional, gShape)) {
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
         if (gShape != std::vector<int64_t>{tokens, valueHeads}) {
             std::cerr << "gOptional expects [T,Nv]\n";
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
         if (!gHt.Create({valueHeads, tokens}, ACL_FLOAT)) {
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
     }
 
     // Convert README layout to the internal layout on device.
-    if (!RunAclnnPermute(query, {1, 0, 2}, queryHtd.tensor, stream, "query TND->HTD") ||
-        !RunAclnnPermute(key, {1, 0, 2}, keyHtd.tensor, stream, "key TND->HTD") ||
-        !RunAclnnPermute(value, {1, 0, 2}, valueHtd.tensor, stream, "value TND->HTD") ||
-        !RunAclnnPermute(beta, {1, 0}, betaHt.tensor, stream, "beta TN->NT") ||
-        !RunAclnnPermute(initialState, {0, 1, 3, 2}, initialStateBhkv.tensor, stream,
-                         "initialState B,Nv,Dv,Dk->B,Nv,Dk,Dv")) {
-        return false;
+    auto status = RunAclnnPermute(query, {1, 0, 2}, queryHtd.tensor, stream, "query TND->HTD");
+    if (status != ACL_SUCCESS) {
+        return status;
+    }
+    status = RunAclnnPermute(key, {1, 0, 2}, keyHtd.tensor, stream, "key TND->HTD");
+    if (status != ACL_SUCCESS) {
+        return status;
+    }
+    status = RunAclnnPermute(value, {1, 0, 2}, valueHtd.tensor, stream, "value TND->HTD");
+    if (status != ACL_SUCCESS) {
+        return status;
+    }
+    status = RunAclnnPermute(beta, {1, 0}, betaHt.tensor, stream, "beta TN->NT");
+    if (status != ACL_SUCCESS) {
+        return status;
+    }
+    status = RunAclnnPermute(
+        initialState, {0, 1, 3, 2}, initialStateBhkv.tensor, stream,
+        "initialState B,Nv,Dv,Dk->B,Nv,Dk,Dv");
+    if (status != ACL_SUCCESS) {
+        return status;
     }
     if (gOptional != nullptr) {
-        if (!RunAclnnPermute(gOptional, {1, 0}, gHt.tensor, stream, "g TN->NT")) {
-            return false;
+        status = RunAclnnPermute(gOptional, {1, 0}, gHt.tensor, stream, "g TN->NT");
+        if (status != ACL_SUCCESS) {
+            return status;
         }
         if (!gBhtView.CreateView(gHt.addr, {1, valueHeads, tokens}, ACL_FLOAT)) {
-            return false;
+            return GDR_ACLNN_STATUS_FAILED;
         }
         gBhtTensor = gBhtView.tensor;
     }
@@ -1150,15 +920,16 @@ inline bool ChunkGatedDeltaRuleTnd(
         !keyBhtdView.CreateView(keyHtd.addr, {1, valueHeads, tokens, keyDim}, inputDType) ||
         !valueBhtdView.CreateView(valueHtd.addr, {1, valueHeads, tokens, valueDim}, inputDType) ||
         !betaBhtView.CreateView(betaHt.addr, {1, valueHeads, tokens}, ACL_FLOAT)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
 
     // Execute the original stitched implementation.
-    if (!ChunkGatedDeltaRuleBhtd(
-            queryBhtdView.tensor, keyBhtdView.tensor, valueBhtdView.tensor, betaBhtView.tensor,
-            initialStateBhkv.tensor, actualSeqLengths, gBhtTensor, scaleValue, chunkSize, outBhtd.tensor,
-            finalStateBhkv.tensor, chunkStateInternal.tensor, stream)) {
-        return false;
+    status = ChunkGatedDeltaRuleBhtd(
+        queryBhtdView.tensor, keyBhtdView.tensor, valueBhtdView.tensor, betaBhtView.tensor, initialStateBhkv.tensor,
+        actualSeqLengths, gBhtTensor, scaleValue, chunkSize, outBhtd.tensor, finalStateBhkv.tensor,
+        chunkStateInternal.tensor, stream);
+    if (status != ACL_SUCCESS) {
+        return status;
     }
 
     // Convert internal outputs back to README layout. chunkState is exposed as
@@ -1166,22 +937,31 @@ inline bool ChunkGatedDeltaRuleTnd(
     if (!outHtdView.CreateView(outBhtd.addr, {valueHeads, tokens, valueDim}, inputDType) ||
         !chunkStateHckvView.CreateView(chunkStateInternal.addr, {valueHeads, totalChunks, keyDim, valueDim},
                                        inputDType)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
-    if (!RunAclnnPermute(outHtdView.tensor, {1, 0, 2}, out, stream, "out HTD->TND") ||
-        !RunAclnnPermute(finalStateBhkv.tensor, {0, 1, 3, 2}, finalState, stream,
-                         "finalState B,Nv,Dk,Dv->B,Nv,Dv,Dk") ||
-        !RunAclnnPermute(chunkStateHckvView.tensor, {1, 0, 3, 2}, chunkState, stream,
-                         "chunkState Nv,C,Dk,Dv->C,Nv,Dv,Dk")) {
-        return false;
+    status = RunAclnnPermute(outHtdView.tensor, {1, 0, 2}, out, stream, "out HTD->TND");
+    if (status != ACL_SUCCESS) {
+        return status;
+    }
+    status = RunAclnnPermute(
+        finalStateBhkv.tensor, {0, 1, 3, 2}, finalState, stream,
+        "finalState B,Nv,Dk,Dv->B,Nv,Dv,Dk");
+    if (status != ACL_SUCCESS) {
+        return status;
+    }
+    status = RunAclnnPermute(
+        chunkStateHckvView.tensor, {1, 0, 3, 2}, chunkState, stream,
+        "chunkState Nv,C,Dk,Dv->C,Nv,Dv,Dk");
+    if (status != ACL_SUCCESS) {
+        return status;
     }
 
-    return true;
+    return ACL_SUCCESS;
 }
 
 // Public dispatching entry. Rank-3 query tensors are treated as README/TND
 // calls, while rank-4 query tensors preserve the original BHTD example API.
-inline bool ChunkGatedDeltaRule(
+inline aclnnStatus ChunkGatedDeltaRule(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -1198,11 +978,11 @@ inline bool ChunkGatedDeltaRule(
 {
     if (query == nullptr) {
         std::cerr << "query must not be null\n";
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     std::vector<int64_t> queryShape;
     if (!GetTensorShape(query, queryShape)) {
-        return false;
+        return GDR_ACLNN_STATUS_FAILED;
     }
     if (queryShape.size() == 3) {
         return ChunkGatedDeltaRuleTnd(
@@ -1215,7 +995,7 @@ inline bool ChunkGatedDeltaRule(
             chunkState, stream);
     }
     std::cerr << "ChunkGatedDeltaRule expects README TND rank 3 or internal BHTD rank 4 query\n";
-    return false;
+    return GDR_ACLNN_STATUS_FAILED;
 }
 
 }  // namespace gdr_aclnn

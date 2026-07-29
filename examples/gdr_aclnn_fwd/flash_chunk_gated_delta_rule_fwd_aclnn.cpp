@@ -471,7 +471,7 @@ bool RunChunkGatedDeltaRule(const Params &params, aclDataType inputDType, Pipeli
 {
     (void)inputDType;
     const aclTensor *actualSeqLengths = params.cuSeqlens.empty() ? nullptr : tensors.actualSeqLengths.tensor;
-    return gdr_aclnn::ChunkGatedDeltaRule(
+    const auto status = gdr_aclnn::ChunkGatedDeltaRule(
         tensors.q.tensor,
         tensors.k.tensor,
         tensors.v.tensor,
@@ -485,6 +485,11 @@ bool RunChunkGatedDeltaRule(const Params &params, aclDataType inputDType, Pipeli
         tensors.finalState.tensor,
         tensors.chunkState.tensor,
         stream);
+    if (status != ACL_SUCCESS) {
+        std::cerr << "gdr_aclnn::ChunkGatedDeltaRule failed: " << status << "\n";
+        return false;
+    }
+    return true;
 }
 
 bool WriteChunkGatedDeltaRuleOutputs(const Params &params, const PipelineTensors &tensors)

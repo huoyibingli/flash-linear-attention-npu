@@ -14,7 +14,7 @@ ChunkLocalCumsum -> ChunkScaledDotKkt -> Cast -> Permute -> SolveTri
 ## 接口原型
 
 ```cpp
-bool gdr_aclnn::ChunkGatedDeltaRule(
+aclnnStatus gdr_aclnn::ChunkGatedDeltaRule(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *value,
@@ -47,6 +47,20 @@ initialState/finalState:[B,Nv,Dv,Dk]
 actualSeqLengths:       [B]
 chunkState:             [totalChunks,Nv,Dv,Dk]
 ```
+
+维度含义：
+
+| 维度 | 含义 |
+| --- | --- |
+| `B` | batch size，批大小；TND 变长场景下等于 `actualSeqLengths` 的元素个数。 |
+| `T` | token 总数或序列长度；dense BHTD 场景下表示每个 batch 的固定序列长度，TND 场景下表示所有序列拼接后的 token 总数。 |
+| `Nk` | query/key 的 head 数。 |
+| `Nv` | value/out 的 head 数；当前小算子拼接实现要求 `Nk == Nv`。 |
+| `Dk` / `K` | query/key 每个 head 的特征维度。 |
+| `Dv` / `V` | value/out 每个 head 的特征维度。 |
+| `H` | 历史 BHT/BHTD 布局中的 head 数，对应当前实现里的统一 head 维度。 |
+| `stateCount` | 状态矩阵的 batch 维度，dense 场景等于 `B`，变长场景等于 `actualSeqLengths.shape[0]`。 |
+| `totalChunks` | 所有序列按 `chunkSize` 切分后的 chunk 总数。 |
 
 接口内部会将 TND 输入通过 `aclnnPermute` 转为当前小算子拼接实现需要的 BHT/BHTD 布局，执行完成后再将 `out`、`finalState` 和 `chunkState` 转回 README/TND 布局。历史 BHT/BHTD 调用仍保留，接口会根据 `query` 的 rank 自动分发。
 
@@ -111,7 +125,7 @@ totalChunks = dense ? ceil(T / chunkSize)
 ```cpp
 const aclTensor *actualSeqLengths = nullptr;  // dense 场景
 
-bool ok = gdr_aclnn::ChunkGatedDeltaRule(
+aclnnStatus status = gdr_aclnn::ChunkGatedDeltaRule(
     query,
     key,
     value,
@@ -125,13 +139,14 @@ bool ok = gdr_aclnn::ChunkGatedDeltaRule(
     finalState,
     chunkState,
     stream);
+bool ok = status == ACL_SUCCESS;
 ```
 
 varlen 场景需要传入 `actualSeqLengths`：
 
 ```cpp
 // actualSeqLengths = [64, 64]
-bool ok = gdr_aclnn::ChunkGatedDeltaRule(
+aclnnStatus status = gdr_aclnn::ChunkGatedDeltaRule(
     query,
     key,
     value,
@@ -145,6 +160,7 @@ bool ok = gdr_aclnn::ChunkGatedDeltaRule(
     finalState,
     chunkState,
     stream);
+bool ok = status == ACL_SUCCESS;
 ```
 
 ## README TND 调用示例
@@ -213,4 +229,4 @@ final_state.bin  // 仅 --output-final-state true 时写出
 - README/TND 布局已支持，但当前要求 `Nk == Nv`。
 - `chunkSize` 是新增的显式入参；README 融合接口没有该参数。
 - `chunkState` 是额外输出，用于保存每个 chunk 的状态矩阵。
-- 当前 helper 返回 `bool`，不是标准 aclnn 两段式 `aclnnStatus` 接口。
+- 当前 helper 返回 `aclnnStatus`，但不是标准 aclnn 两段式 `GetWorkspaceSize + Run` 接口。

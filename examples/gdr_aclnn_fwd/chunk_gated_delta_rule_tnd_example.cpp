@@ -361,11 +361,15 @@ bool RunPipeline(const Params &params)
             throw std::runtime_error("failed to prepare device tensors");
         }
 
-        ok = ok && gdr_aclnn::ChunkGatedDeltaRule(
-                       tensors.queryTnd.tensor, tensors.keyTnd.tensor, tensors.valueTnd.tensor, tensors.betaTh.tensor,
-                       tensors.initialStateBhvK.tensor, tensors.actualSeqLengths.tensor, tensors.gTh.tensor,
-                       static_cast<float>(params.scale), params.chunkSize, tensors.outTnd.tensor,
-                       tensors.finalStateBhvK.tensor, tensors.chunkStateExternal.tensor, stream);
+        const auto status = gdr_aclnn::ChunkGatedDeltaRule(
+            tensors.queryTnd.tensor, tensors.keyTnd.tensor, tensors.valueTnd.tensor, tensors.betaTh.tensor,
+            tensors.initialStateBhvK.tensor, tensors.actualSeqLengths.tensor, tensors.gTh.tensor,
+            static_cast<float>(params.scale), params.chunkSize, tensors.outTnd.tensor, tensors.finalStateBhvK.tensor,
+            tensors.chunkStateExternal.tensor, stream);
+        if (status != ACL_SUCCESS) {
+            std::cerr << "gdr_aclnn::ChunkGatedDeltaRule failed: " << status << "\n";
+            ok = false;
+        }
 
         if (ok) {
             std::vector<uint8_t> outTndBytes;
