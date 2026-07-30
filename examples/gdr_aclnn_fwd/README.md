@@ -35,7 +35,7 @@ aclnnStatus gdr_aclnn::ChunkGatedDeltaRule(
 该接口用于在调用层替换原融合算子 `aclnnChunkGatedDeltaRule` 的调用。README/TND 场景下，除以下两点外，参数含义和 shape 尽量与融合算子保持一致：
 
 - 新增显式属性 `chunkSize`，用于内部生成 `cuSeqlens` 和 `chunkIndices`。
-- 新增输出 `chunkState`，用于保存每个 chunk 的状态矩阵。
+- 新增输出 `chunkState`，用于保存每个 chunk 开始前的状态矩阵。
 
 README/TND 调用时，输入输出 tensor 使用融合算子 README 中的业务 shape：
 
@@ -79,7 +79,7 @@ chunkState:             [totalChunks,Nv,Dv,Dk]
 | `chunkSize` | 属性 | chunk 大小，必须显式传入。接口会用它从 `actualSeqLengths` 生成 `cuSeqlens` 和 `chunkIndices`。 |
 | `out` | 输出 | attention 输出。README shape 为 `[T,Nv,Dv]`，兼容旧 shape `[B,H,T,V]`，dtype 与 `query` 一致。 |
 | `finalState` | 输出 | 最终状态矩阵。README shape 为 `[B,Nv,Dv,Dk]`，兼容旧 shape `[stateCount,H,K,V]`。 |
-| `chunkState` | 输出 | 每个 chunk 的状态矩阵，即原 `h` 输出。README shape 为 `[totalChunks,Nv,Dv,Dk]`，兼容旧 shape `[B,H,totalChunks,K,V]`。 |
+| `chunkState` | 输出 | 每个 chunk 开始前的状态矩阵，即原 `h` 输出。README shape 为 `[totalChunks,Nv,Dv,Dk]`，兼容旧 shape `[B,H,totalChunks,K,V]`。 |
 | `stream` | 输入 | ACL runtime stream。 |
 
 ## Shape 约束
@@ -117,6 +117,56 @@ totalChunks = dense ? ceil(T / chunkSize)
 ```
 
 `ChunkGatedDeltaRule` 会校验 `chunkState` 的 chunk 维度是否等于按 `chunkSize` 计算出的 `totalChunks`。
+
+## chunkState 与 finalState
+
+`chunk` 只沿 token 序列维度 `T` 切分，不切 batch 维、head 维，也不切 `Dk/K` 或 `Dv/V` 特征维。每个 chunk 只读取自己范围内的 `query/key/value/beta/gOptional`，后续 chunk 通过起始 state 继承前面 chunk 压缩后的历史信息，不会重新读取前面 chunk 的 token。
+
+`chunkState` 是 `aclnnChunkGatedDeltaRuleFwdH` 的 `h` 输出，保存的是每个 chunk 开始前的 state 缓存。可以按如下逻辑理解：
+
+```text
+state = initialState
+
+for chunk_id in range(totalChunks):
+    chunkState[chunk_id] = state
+    state = update(state, current_chunk_tokens)
+
+finalState = state
+```
+
+因此 `chunkState` 和 `finalState` 的关系是：
+
+- `chunkState[0]` 是第 0 个 chunk 开始前的状态，通常等于 `initialState` 或全 0 初始状态。
+- `chunkState[i]` 是第 `i` 个 chunk 的输入状态，也就是第 `i - 1` 个 chunk 处理完成后的状态。
+- `finalState` 是最后一个有效 token 处理完成后的最终状态。
+- `finalState` 通常不等于最后一个 `chunkState`。最后一个 `chunkState` 是最后一个 chunk 的输入状态，`finalState` 是最后一个 chunk 的输出状态。
+
+以 `T = 555`、`chunkSize = 128` 为例，token 维会切成 5 个 chunk：
+
+```text
+chunk0: token [0,   127]
+chunk1: token [128, 255]
+chunk2: token [256, 383]
+chunk3: token [384, 511]
+chunk4: token [512, 554]
+```
+
+状态传递关系为：
+
+```text
+initialState -> chunk0 -> state_1 -> chunk1 -> state_2 -> ... -> chunk4 -> finalState
+
+chunkState[0] = initialState
+chunkState[1] = state_1
+chunkState[2] = state_2
+chunkState[3] = state_3
+chunkState[4] = state_4
+finalState    = chunk4 处理完成后的 state
+```
+
+当 `T` 不能被 `chunkSize` 整除时，最后一个 chunk 可能不是满 chunk。正确语义下，padding token 不应更新状态，`finalState` 对应最后一个有效 token 处理完成后的状态。
+
+README/TND 布局下，`chunkState` 输出 shape 是 `[totalChunks,Nv,Dv,Dk]`。变长场景中 `totalChunks` 按 `actualSeqLengths` 逐条序列累加得到，chunk 顺序与 `actualSeqLengths` 的序列顺序一致。历史 BHT/BHTD 布局下，`chunkState` shape 是 `[B,H,totalChunks,K,V]`。
 
 ## 使用方法
 
