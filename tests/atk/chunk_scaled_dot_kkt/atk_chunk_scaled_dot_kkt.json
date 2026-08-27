@@ -31362,7 +31362,7 @@
     {
         "id": 196,
         "default_seed": 20261013,
-        "name": "chunk_scaled_dot_kkt_0196_BSND_noGVA_V128_14_B24",
+        "name": "chunk_scaled_dot_kkt_0196_tilingkey_bt16",
         "aclnn_name": "",
         "version": "v2.1",
         "api": "pytorch",
@@ -31415,7 +31415,7 @@
                 "required": true,
                 "dtype": "non_param",
                 "shape": null,
-                "range_values": "{\"name\":\"BSND_noGVA_V128_14_B24\",\"B\":24,\"HK\":8,\"HV\":8,\"T\":1344,\"K\":128,\"V\":128,\"chunk_size\":64,\"source\":\"BSND_noGVA_V128_14_B24\",\"scaled\":false,\"dtype\":\"bf16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":196,\"shape_id\":98,\"seed\":20261013,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
+                "range_values": "{\"name\":\"tilingkey_bt16\",\"B\":1,\"HK\":2,\"HV\":2,\"T\":128,\"K\":128,\"V\":128,\"chunk_size\":16,\"source\":\"tilingkey_bt16\",\"scaled\":false,\"dtype\":\"bf16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":196,\"shape_id\":98,\"seed\":20261013,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
                 "backward": false
             },
             {
@@ -31433,7 +31433,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 24,
+                "range_values": 1,
                 "backward": false
             },
             {
@@ -31442,7 +31442,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 8,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31451,7 +31451,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 8,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31460,7 +31460,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 1344,
+                "range_values": 128,
                 "backward": false
             },
             {
@@ -31478,7 +31478,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 64,
+                "range_values": 16,
                 "backward": false
             },
             {
@@ -31522,7 +31522,7 @@
     {
         "id": 197,
         "default_seed": 20261014,
-        "name": "chunk_scaled_dot_kkt_0197_BSND_noGVA_V128_14_B24",
+        "name": "chunk_scaled_dot_kkt_0197_tilingkey_bt16",
         "aclnn_name": "",
         "version": "v2.1",
         "api": "pytorch",
@@ -31575,7 +31575,7 @@
                 "required": true,
                 "dtype": "non_param",
                 "shape": null,
-                "range_values": "{\"name\":\"BSND_noGVA_V128_14_B24\",\"B\":24,\"HK\":8,\"HV\":8,\"T\":1344,\"K\":128,\"V\":128,\"chunk_size\":64,\"source\":\"BSND_noGVA_V128_14_B24\",\"scaled\":false,\"dtype\":\"fp16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":197,\"shape_id\":98,\"seed\":20261014,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
+                "range_values": "{\"name\":\"tilingkey_bt16\",\"B\":1,\"HK\":2,\"HV\":2,\"T\":128,\"K\":128,\"V\":128,\"chunk_size\":16,\"source\":\"tilingkey_bt16\",\"scaled\":false,\"dtype\":\"fp16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":197,\"shape_id\":98,\"seed\":20261014,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
                 "backward": false
             },
             {
@@ -31593,7 +31593,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 24,
+                "range_values": 1,
                 "backward": false
             },
             {
@@ -31602,7 +31602,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 8,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31611,7 +31611,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 8,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31620,7 +31620,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 1344,
+                "range_values": 128,
                 "backward": false
             },
             {
@@ -31638,7 +31638,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 64,
+                "range_values": 16,
                 "backward": false
             },
             {
@@ -31682,7 +31682,7 @@
     {
         "id": 198,
         "default_seed": 20261015,
-        "name": "chunk_scaled_dot_kkt_0198_BSND_noGVA_V128_15_B12",
+        "name": "chunk_scaled_dot_kkt_0198_tilingkey_bt32",
         "aclnn_name": "",
         "version": "v2.1",
         "api": "pytorch",
@@ -31735,7 +31735,7 @@
                 "required": true,
                 "dtype": "non_param",
                 "shape": null,
-                "range_values": "{\"name\":\"BSND_noGVA_V128_15_B12\",\"B\":12,\"HK\":16,\"HV\":16,\"T\":1344,\"K\":128,\"V\":128,\"chunk_size\":64,\"source\":\"BSND_noGVA_V128_15_B12\",\"scaled\":false,\"dtype\":\"bf16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":198,\"shape_id\":99,\"seed\":20261015,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
+                "range_values": "{\"name\":\"tilingkey_bt32\",\"B\":1,\"HK\":2,\"HV\":2,\"T\":128,\"K\":128,\"V\":128,\"chunk_size\":32,\"source\":\"tilingkey_bt32\",\"scaled\":false,\"dtype\":\"bf16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":198,\"shape_id\":99,\"seed\":20261015,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
                 "backward": false
             },
             {
@@ -31753,7 +31753,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 12,
+                "range_values": 1,
                 "backward": false
             },
             {
@@ -31762,7 +31762,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 16,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31771,7 +31771,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 16,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31780,7 +31780,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 1344,
+                "range_values": 128,
                 "backward": false
             },
             {
@@ -31798,7 +31798,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 64,
+                "range_values": 32,
                 "backward": false
             },
             {
@@ -31842,7 +31842,7 @@
     {
         "id": 199,
         "default_seed": 20261016,
-        "name": "chunk_scaled_dot_kkt_0199_BSND_noGVA_V128_15_B12",
+        "name": "chunk_scaled_dot_kkt_0199_tilingkey_bt32",
         "aclnn_name": "",
         "version": "v2.1",
         "api": "pytorch",
@@ -31895,7 +31895,7 @@
                 "required": true,
                 "dtype": "non_param",
                 "shape": null,
-                "range_values": "{\"name\":\"BSND_noGVA_V128_15_B12\",\"B\":12,\"HK\":16,\"HV\":16,\"T\":1344,\"K\":128,\"V\":128,\"chunk_size\":64,\"source\":\"BSND_noGVA_V128_15_B12\",\"scaled\":false,\"dtype\":\"fp16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":199,\"shape_id\":99,\"seed\":20261016,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
+                "range_values": "{\"name\":\"tilingkey_bt32\",\"B\":1,\"HK\":2,\"HV\":2,\"T\":128,\"K\":128,\"V\":128,\"chunk_size\":32,\"source\":\"tilingkey_bt32\",\"scaled\":false,\"dtype\":\"fp16\",\"op\":\"chunk_scaled_dot_kkt\",\"case_id\":199,\"shape_id\":99,\"seed\":20261016,\"route\":\"ascendc\",\"soc\":\"ascend910b\"}",
                 "backward": false
             },
             {
@@ -31913,7 +31913,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 12,
+                "range_values": 1,
                 "backward": false
             },
             {
@@ -31922,7 +31922,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 16,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31931,7 +31931,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 16,
+                "range_values": 2,
                 "backward": false
             },
             {
@@ -31940,7 +31940,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 1344,
+                "range_values": 128,
                 "backward": false
             },
             {
@@ -31958,7 +31958,7 @@
                 "required": true,
                 "dtype": "int",
                 "shape": null,
-                "range_values": 64,
+                "range_values": 32,
                 "backward": false
             },
             {

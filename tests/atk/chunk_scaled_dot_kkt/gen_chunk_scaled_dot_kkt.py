@@ -21,6 +21,9 @@ OP_NAME = "chunk_scaled_dot_kkt"
 DTYPES = ("bf16", "fp16")
 _SEED_BASE = 20260817
 _MAX_BHT = 512 * 1024
+_SUPPORTED_CHUNK_SIZES = (16, 32, 64, 128)
+# tiling key 由 dtype × chunk_size 决定；覆盖用例使用最小代表性 shape（B, HV, HK, T, V, K）。
+_TILING_KEY_COVERAGE_SHAPE = (1, 2, 2, 128, 128, 128)
 
 
 # (name, B, HV, HK, T, V, K, chunk_size)
@@ -74,8 +77,8 @@ def _normalize(name: str, B: int, HV: int, HK: int, T: int, V: int, K: int, chun
         raise ValueError(f"K must be 128, got {K}")
     if V not in (128, 256):
         raise ValueError(f"V must be 128/256, got {V}")
-    if chunk_size not in (64, 128):
-        raise ValueError(f"chunk_size must be 64/128, got {chunk_size}")
+    if chunk_size not in _SUPPORTED_CHUNK_SIZES:
+        raise ValueError(f"chunk_size must be one of {_SUPPORTED_CHUNK_SIZES}, got {chunk_size}")
 
     scaled = False
     bht = B * HV * T
@@ -234,13 +237,28 @@ def _build_unique_shape_profiles(count: int = 100, key_fields: tuple[str, ...] |
     raise RuntimeError(f"failed to build {count} unique GDN shape profiles for fields={key_fields!r}")
 
 
+def _ensure_tiling_key_coverage(shapes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """保证每个支持的 chunk_size 档位至少有一个 shape，覆盖全部 tiling key。
+
+    基表与扩展流程只产生 64/128 档位；缺失档位用固定小 shape 补齐，并替换
+    尾部合成 shape，保持 shape 总数不变，默认 `atk case -dt` 参数即可复现。
+    """
+    missing = [cs for cs in _SUPPORTED_CHUNK_SIZES if all(s["chunk_size"] != cs for s in shapes)]
+    if not missing:
+        return shapes
+    b, hv, hk, t, v, k = _TILING_KEY_COVERAGE_SHAPE
+    covered = [_normalize(f"tilingkey_bt{cs}", b, hv, hk, t, v, k, cs) for cs in missing]
+    keep = max(0, len(shapes) - len(covered))
+    return shapes[:keep] + covered
+
+
 def _build_atk_profiles(
     op_name: str,
     shape_count: int = 100,
     soc: str = "ascend910b",
     key_fields: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    shapes = _build_unique_shape_profiles(shape_count, key_fields)
+    shapes = _ensure_tiling_key_coverage(_build_unique_shape_profiles(shape_count, key_fields))
     profiles: list[dict[str, Any]] = []
     for shape_id, shape in enumerate(shapes):
         for dtype_id, dtype in enumerate(DTYPES):

@@ -67,6 +67,14 @@ YAML 元信息覆盖 `ascend910b`、`ascend910_93` 和 `ascend950`，可配合�
 - BF16 用例：`{"dtype": "bf16", "B": 1, "HK": 1, "HV": 1, "T": 16, "K": 16, "chunk_size": 16, "op": "chunk_scaled_dot_kkt", "case_id": 0, "seed": 20260817, "route": "ascendc", "soc": "ascend910b"}`
 - FP16 用例：`{"dtype": "fp16", "B": 1, "HK": 1, "HV": 1, "T": 16, "K": 16, "chunk_size": 16, "op": "chunk_scaled_dot_kkt", "case_id": 1, "seed": 20260818, "route": "ascendc", "soc": "ascend910b"}`
 
+## Tiling key 覆盖
+
+tiling key 由 dtype（fp16=10/bf16=20）与 chunk_size 档位（64=0/16=1/32=2/128=3，左移 8 位）决定，共 8 个。
+主精度用例集（`atk_chunk_scaled_dot_kkt.json`）覆盖全部 8 个 tiling key。生成器基表与扩展流程只产生
+`chunk_size` 64/128 档位，`gen_chunk_scaled_dot_kkt.py` 的 `_ensure_tiling_key_coverage` 会为缺失档位
+自动补充固定覆盖 shape（当前为 case 196-199 的 BT16/BT32，shape `B=1, HK=2, HV=2, T=128, K=128`），
+并替换尾部合成 shape 以保持用例总数 200 不变；`gen_cases` 默认参数（`-dt 100`）即可复现，无需手工追加。
+
 ## 执行方式
 
 ```bash
