@@ -107,23 +107,27 @@ bool MulOverflow(uint64_t a, uint64_t b, uint64_t *out)
 bool IsCatlassScoreArchSupported(NpuArch npuArch)
 {
     // Keep CATLASS score on SOCs with a matching arch tag and validated cross-core pipeline.
+    return npuArch == NpuArch::DAV_2201 || npuArch == NpuArch::DAV_3510;
+}
+
+bool RequiresCatlassScorePath(NpuArch npuArch)
+{
+    // ascend950 kernels do not compile the matmul-api score path, so inputs outside the
+    // CATLASS score support range must fail fast there; 910b/910_93 fall back instead.
     return npuArch == NpuArch::DAV_3510;
 }
 
-uint64_t ScoreRowBlockSize(uint64_t bt, NpuArch npuArch)
+uint64_t ScoreRowBlockSize(uint64_t bt)
 {
-    uint64_t rowBlock = static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_A2);
-    if (npuArch == NpuArch::DAV_3510) {
-        rowBlock = bt <= static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_A5_BT64)
-                       ? static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_A5_BT64)
-                       : static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_A5_BT128);
-    }
+    const uint64_t rowBlock = bt <= static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_BT64)
+                                  ? static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_BT64)
+                                  : static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_BT128);
     return std::min<uint64_t>(bt, rowBlock);
 }
 
-uint64_t ScoreRowBlockCount(uint64_t bt, NpuArch npuArch)
+uint64_t ScoreRowBlockCount(uint64_t bt)
 {
-    const uint64_t rowBlockSize = ScoreRowBlockSize(bt, npuArch);
+    const uint64_t rowBlockSize = ScoreRowBlockSize(bt);
     return rowBlockSize == 0 ? 0 : CeilDiv(bt, rowBlockSize);
 }
 
@@ -137,7 +141,7 @@ uint64_t ScoreGroupBatch(uint64_t scoreBlockTaskNum,
     if (!useCatlassScore || usedAicNum == 0 || scoreBlockTaskNum == 0) {
         return 1;
     }
-    if (bt == static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_A5_BT128) &&
+    if (bt == static_cast<uint64_t>(NsChunkScaledDotKkt::SCORE_ROW_BLOCK_BT128) &&
         (isVarlen != 0 || (t % bt) != 0)) {
         return 1;
     }
@@ -292,7 +296,7 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
     uint64_t scoreBlockTaskNum = 0;
-    if (MulOverflow(scoreTaskNum, ScoreRowBlockCount(bt, npuArch), &scoreBlockTaskNum) || scoreBlockTaskNum == 0) {
+    if (MulOverflow(scoreTaskNum, ScoreRowBlockCount(bt), &scoreBlockTaskNum) || scoreBlockTaskNum == 0) {
         return ge::GRAPH_FAILED;
     }
 
@@ -300,7 +304,7 @@ ge::graphStatus TilingFunc(gert::TilingContext *context)
     const bool useCatlassScore =
         catlassScoreArchSupported && pairableAicNum > 0 &&
         bt >= static_cast<uint64_t>(NsChunkScaledDotKkt::CATLASS_SCORE_MIN_BT) && (k % 16) == 0;
-    if (catlassScoreArchSupported && !useCatlassScore) {
+    if (RequiresCatlassScorePath(npuArch) && !useCatlassScore) {
         return ge::GRAPH_FAILED;
     }
     const uint64_t aicTaskNum = useCatlassScore ? scoreBlockTaskNum : scoreTaskNum;

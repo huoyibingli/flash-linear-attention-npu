@@ -284,20 +284,15 @@ private:
                BT_ * BT_;
     }
 
-    __aicore__ inline int64_t SelectA5ScoreRowBlockLimit(int64_t bt) const
+    __aicore__ inline int64_t SelectScoreRowBlockLimit(int64_t bt) const
     {
-        return bt <= static_cast<int64_t>(SCORE_ROW_BLOCK_A5_BT64)
-                   ? static_cast<int64_t>(SCORE_ROW_BLOCK_A5_BT64)
-                   : static_cast<int64_t>(SCORE_ROW_BLOCK_A5_BT128);
+        return bt <= static_cast<int64_t>(SCORE_ROW_BLOCK_BT64) ? static_cast<int64_t>(SCORE_ROW_BLOCK_BT64)
+                                                                : static_cast<int64_t>(SCORE_ROW_BLOCK_BT128);
     }
 
     __aicore__ inline int64_t ScoreRowBlockSize() const
     {
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-        const int64_t rowBlock = SelectA5ScoreRowBlockLimit(BT_);
-#else
-        constexpr int64_t rowBlock = SCORE_ROW_BLOCK_A2;
-#endif
+        const int64_t rowBlock = SelectScoreRowBlockLimit(BT_);
         return BT_ < rowBlock ? BT_ : rowBlock;
     }
 
@@ -388,12 +383,8 @@ private:
         if (cubeIdx >= usedAicNum_ || usedAicNum_ <= 0) {
             return;
         }
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         constexpr int32_t ROW_BLOCK_LIMIT =
-            BT_VALUE <= SCORE_ROW_BLOCK_A5_BT64 ? SCORE_ROW_BLOCK_A5_BT64 : SCORE_ROW_BLOCK_A5_BT128;
-#else
-        constexpr int32_t ROW_BLOCK_LIMIT = SCORE_ROW_BLOCK_A2;
-#endif
+            BT_VALUE <= SCORE_ROW_BLOCK_BT64 ? SCORE_ROW_BLOCK_BT64 : SCORE_ROW_BLOCK_BT128;
         constexpr int32_t ROW_BLOCK_VALUE = BT_VALUE < ROW_BLOCK_LIMIT ? BT_VALUE : ROW_BLOCK_LIMIT;
         using L1TileShape = tla::Shape<tla::Int<ROW_BLOCK_VALUE>, tla::Int<BT_VALUE>, KktInt128>;
         using L0TileShape = L1TileShape;
@@ -527,7 +518,16 @@ private:
                                             int64_t scoreGroupBatch)
     {
         const int64_t cubeIdx = static_cast<int64_t>(GetBlockIdx()) / subBlockNum;
-        for (int64_t batchIdx = 0; batchIdx < scoreGroupBatch; ++batchIdx) {
+        // With multiple score blocks per group, split whole blocks across the paired AIV
+        // sub-blocks so each score tile is fetched from GM once; row interleaving would
+        // duplicate the score read on every sub-block. Single-block groups keep the row
+        // split for intra-block parallelism.
+        const bool blockGranular = subBlockNum > 1 && scoreGroupBatch >= subBlockNum;
+        const int64_t batchBegin = blockGranular ? subBlockIdx : 0;
+        const int64_t batchStep = blockGranular ? subBlockNum : 1;
+        const int64_t epilogueSubBlockIdx = blockGranular ? 0 : subBlockIdx;
+        const int64_t epilogueSubBlockNum = blockGranular ? 1 : subBlockNum;
+        for (int64_t batchIdx = batchBegin; batchIdx < scoreGroupBatch; batchIdx += batchStep) {
             const int64_t scoreBlockTask = scoreGroupBase + batchIdx * usedAicNum_;
             if (scoreBlockTask >= scoreBlockTaskNum) {
                 break;
@@ -540,8 +540,8 @@ private:
                 continue;
             }
             const int64_t scoreOffset = GetScoreOffset(cubeIdx, scoreSlot, batchIdx);
-            ComputeEpilogueScoreBlockRowsHvGroup(meta, rowBegin, rowCount, colCount, scoreOffset, subBlockIdx,
-                                                 subBlockNum);
+            ComputeEpilogueScoreBlockRowsHvGroup(meta, rowBegin, rowCount, colCount, scoreOffset,
+                                                 epilogueSubBlockIdx, epilogueSubBlockNum);
         }
     }
 
